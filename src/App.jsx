@@ -793,7 +793,7 @@ export default function App() {
           const decimals = m.key === "voc" ? 0 : 1;
 
           return (
-            <Glass key={m.key} className="p-6 flex flex-col items-center text-center">
+            <Glass key={m.key} className="p-6 text-center">
               <div className="w-full flex items-center justify-between">
                 <div className="flex items-center gap-2 text-white/50 text-[13px]">
                   <Icon size={15} />
