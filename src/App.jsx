@@ -55,7 +55,7 @@ const METRICS = {
     key: "lembap",
   },
   voc: {
-    label: "VOC (MQ-135)",
+    label: "VOC (MS-1100)",
     unit: "ppm",
     icon: Wind,
     color: "#b79cff",
