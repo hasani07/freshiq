@@ -339,11 +339,12 @@ export default function App() {
     let s = 26.5,
       l = 58,
       v = 180;
+    const nowMs = Date.now();
     for (let i = 0; i < HISTORY_LEN; i++) {
       s = nextWalk(s, METRICS.suhu.bounds, 1.2, 0.01);
       l = nextWalk(l, METRICS.lembap.bounds, 2.5, 0.01);
       v = nextWalk(v, METRICS.voc.bounds, 25, 0.02);
-      arr.push({ t: i, suhu: s, lembap: l, voc: v, label: "" });
+      arr.push({ t: i, time: nowMs - (HISTORY_LEN - 1 - i) * 2200, suhu: s, lembap: l, voc: v });
     }
     return arr;
   });
@@ -424,7 +425,7 @@ export default function App() {
         });
 
         setHistory((h) => {
-          const point = { t: h[h.length - 1].t + 1, ...next };
+          const point = { t: h[h.length - 1].t + 1, time: Date.now(), ...next };
           return [...h.slice(1), point];
         });
         return next;
@@ -453,7 +454,9 @@ export default function App() {
         return;
       }
       const ordered = [...data].reverse();
-      setHistory(ordered.map((r, i) => ({ t: i, suhu: r.suhu, lembap: r.lembap, voc: r.voc })));
+      setHistory(
+        ordered.map((r, i) => ({ t: i, time: new Date(r.created_at).getTime(), suhu: r.suhu, lembap: r.lembap, voc: r.voc }))
+      );
       setCurrent(ordered[ordered.length - 1]);
       setLastUpdate(new Date(ordered[ordered.length - 1].created_at));
       setSupaStatus("ok");
@@ -473,7 +476,13 @@ export default function App() {
           setLastUpdate(new Date(next.created_at));
           setHistory((h) => {
             const last = h[h.length - 1];
-            const point = { t: (last?.t ?? 0) + 1, suhu: next.suhu, lembap: next.lembap, voc: next.voc };
+            const point = {
+              t: (last?.t ?? 0) + 1,
+              time: new Date(next.created_at).getTime(),
+              suhu: next.suhu,
+              lembap: next.lembap,
+              voc: next.voc,
+            };
             return [...h.slice(1), point];
           });
           setThresholds((th) => {
@@ -850,7 +859,17 @@ export default function App() {
                   </linearGradient>
                 </defs>
                 <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                <XAxis dataKey="t" hide />
+                <XAxis
+                  dataKey="time"
+                  type="number"
+                  domain={["dataMin", "dataMax"]}
+                  scale="time"
+                  tickFormatter={(t) => formatHM(new Date(t))}
+                  tick={{ fill: "rgba(255,255,255,0.35)", fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                  minTickGap={40}
+                />
                 <YAxis
                   domain={activeMetric.bounds}
                   tick={{ fill: "rgba(255,255,255,0.35)", fontSize: 11 }}
@@ -866,7 +885,7 @@ export default function App() {
                     borderRadius: 12,
                     fontSize: 12.5,
                   }}
-                  labelFormatter={() => ""}
+                  labelFormatter={(label) => formatClock(new Date(label))}
                   formatter={(v) => [`${v.toFixed(1)} ${activeMetric.unit}`, activeMetric.label]}
                 />
                 <Area type="monotone" dataKey="value" stroke={activeMetric.color} strokeWidth={2.2} fill="url(#fillMetric)" />
