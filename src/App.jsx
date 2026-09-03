@@ -811,7 +811,7 @@ export default function App() {
                 </span>
               </div>
 
-              <div className="relative mt-5">
+              <div className="relative mt-5 mx-auto w-[148px] h-[148px]">
                 <RingGauge
                   value={val}
                   min={min}
