@@ -161,6 +161,9 @@ function RingGauge({ value, min, max, boundsMin, boundsMax, color, size = 108 })
           area yang diperluas (kombinasi itu pernah bikin ring terlihat sedikit geser
           dari pusat di beberapa browser). */}
       <g transform={`rotate(-90 ${cx} ${cy})`}>
+        {/* Arc nilai sengaja digambar SIMETRIS dari titik atas (bukan menyapu searah jarum jam):
+            strokeDashoffset={dash/2} menggeser separuh panjang arc ke sisi berlawanan, jadi
+            arc tumbuh ke kiri & kanan secara merata dari atas. */}
         <circle
           cx={cx}
           cy={cy}
@@ -188,9 +191,10 @@ function RingGauge({ value, min, max, boundsMin, boundsMax, color, size = 108 })
           stroke={color}
           strokeWidth={stroke}
           strokeDasharray={`${dash} ${circumference - dash}`}
+          strokeDashoffset={dash / 2}
           strokeLinecap="round"
           filter={`url(#${filterId})`}
-          style={{ transition: "stroke-dasharray 0.6s ease" }}
+          style={{ transition: "stroke-dasharray 0.6s ease, stroke-dashoffset 0.6s ease" }}
         />
       </g>
     </svg>
