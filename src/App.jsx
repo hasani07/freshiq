@@ -131,6 +131,8 @@ function formatBytes(rows) {
 function RingGauge({ value, min, max, boundsMin, boundsMax, color, size = 108 }) {
   const stroke = 9;
   const r = (size - stroke) / 2;
+  const cx = size / 2;
+  const cy = size / 2;
   const circumference = 2 * Math.PI * r;
   const pct = clamp((value - boundsMin) / (boundsMax - boundsMin), 0, 1);
   const dash = pct * circumference;
@@ -143,7 +145,7 @@ function RingGauge({ value, min, max, boundsMin, boundsMax, color, size = 108 })
   const filterId = `glow-${color.replace("#", "")}`;
 
   return (
-    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="-rotate-90 overflow-visible">
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="overflow-visible">
       <defs>
         <filter id={filterId} x="-60%" y="-60%" width="220%" height="220%">
           <feGaussianBlur in="SourceGraphic" stdDeviation="3.2" result="blur" />
@@ -153,37 +155,44 @@ function RingGauge({ value, min, max, boundsMin, boundsMax, color, size = 108 })
           </feMerge>
         </filter>
       </defs>
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={r}
-        fill="none"
-        stroke="rgba(255,255,255,0.08)"
-        strokeWidth={stroke}
-      />
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={r}
-        fill="none"
-        stroke="rgba(110,231,183,0.28)"
-        strokeWidth={stroke}
-        strokeDasharray={`${rangeDash} ${circumference - rangeDash}`}
-        strokeDashoffset={rangeOffset}
-        strokeLinecap="round"
-      />
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={r}
-        fill="none"
-        stroke={color}
-        strokeWidth={stroke}
-        strokeDasharray={`${dash} ${circumference - dash}`}
-        strokeLinecap="round"
-        filter={`url(#${filterId})`}
-        style={{ transition: "stroke-dasharray 0.6s ease" }}
-      />
+      {/* Rotasi -90° dilakukan di sini (koordinat SVG murni), BUKAN lewat CSS transform
+          di elemen <svg>. Ini supaya titik pusat rotasi selalu pasti di (cx, cy), tidak
+          tergantung cara browser menghitung transform-origin saat ada filter dengan
+          area yang diperluas (kombinasi itu pernah bikin ring terlihat sedikit geser
+          dari pusat di beberapa browser). */}
+      <g transform={`rotate(-90 ${cx} ${cy})`}>
+        <circle
+          cx={cx}
+          cy={cy}
+          r={r}
+          fill="none"
+          stroke="rgba(255,255,255,0.08)"
+          strokeWidth={stroke}
+        />
+        <circle
+          cx={cx}
+          cy={cy}
+          r={r}
+          fill="none"
+          stroke="rgba(110,231,183,0.28)"
+          strokeWidth={stroke}
+          strokeDasharray={`${rangeDash} ${circumference - rangeDash}`}
+          strokeDashoffset={rangeOffset}
+          strokeLinecap="round"
+        />
+        <circle
+          cx={cx}
+          cy={cy}
+          r={r}
+          fill="none"
+          stroke={color}
+          strokeWidth={stroke}
+          strokeDasharray={`${dash} ${circumference - dash}`}
+          strokeLinecap="round"
+          filter={`url(#${filterId})`}
+          style={{ transition: "stroke-dasharray 0.6s ease" }}
+        />
+      </g>
     </svg>
   );
 }
@@ -331,6 +340,15 @@ function buildInsights(current, thresholds, fanOn, fanMode, seedTick) {
 
 const HISTORY_LEN = 40;
 
+const DEFAULT_THRESHOLDS = {
+  suhuMin: 22,
+  suhuMax: 30,
+  lembapMin: 40,
+  lembapMax: 70,
+  vocMin: 0,
+  vocMax: 400,
+};
+
 export default function App() {
   const [now, setNow] = useState(new Date());
   const [current, setCurrent] = useState({ suhu: 26.5, lembap: 58, voc: 180 });
@@ -349,14 +367,7 @@ export default function App() {
     return arr;
   });
 
-  const [thresholds, setThresholds] = useState({
-    suhuMin: 22,
-    suhuMax: 30,
-    lembapMin: 40,
-    lembapMax: 70,
-    vocMin: 0,
-    vocMax: 400,
-  });
+  const [thresholds, setThresholds] = useState(DEFAULT_THRESHOLDS);
 
   const [fanMode, setFanMode] = useState("auto"); // auto | manual
   const [fanManualOn, setFanManualOn] = useState(false);
@@ -1037,7 +1048,21 @@ export default function App() {
 
         {/* threshold */}
         <Glass>
-          <SectionTitle icon={Settings2} title="Rentang ideal" sub="Atur ambang tiap sensor" />
+          <SectionTitle
+            icon={Settings2}
+            title="Rentang ideal"
+            sub="Atur ambang tiap sensor"
+            action={
+              <button
+                onClick={() => setThresholds(DEFAULT_THRESHOLDS)}
+                className="h-8 px-3 rounded-full border border-white/10 bg-white/5 flex items-center gap-1.5 text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors text-[12px]"
+                title="Kembalikan ke rentang default"
+              >
+                <RefreshCw size={13} />
+                Reset
+              </button>
+            }
+          />
           <div className="px-6 pb-6 pt-3 flex flex-col gap-6">
             {Object.values(METRICS).map((m) => {
               const min = thresholds[`${m.key}Min`];
