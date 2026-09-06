@@ -32,6 +32,8 @@ import {
   UploadCloud,
   CheckCircle2,
   AlertCircle,
+  Lock,
+  Unlock,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -424,6 +426,34 @@ export default function App() {
   const [otaNotes, setOtaNotes] = useState("");
   const [otaStatus, setOtaStatus] = useState("idle"); // idle | uploading | success | error
   const [otaError, setOtaError] = useState("");
+
+  // gerbang PIN sebelum panel upload OTA bisa dipakai. Pengecekan PIN dilakukan
+  // di Edge Function Supabase (server), BUKAN di sini — jadi PIN aslinya tidak
+  // pernah dikirim ke atau tersimpan di kode frontend/browser.
+  const [otaUnlocked, setOtaUnlocked] = useState(false);
+  const [otaPinInput, setOtaPinInput] = useState("");
+  const [otaPinError, setOtaPinError] = useState(false);
+  const [otaChecking, setOtaChecking] = useState(false);
+
+  const handleUnlockOta = async () => {
+    if (!supabase || !otaPinInput.trim()) return;
+    setOtaChecking(true);
+    setOtaPinError(false);
+    try {
+      const { data, error } = await supabase.functions.invoke("check-ota-pin", {
+        body: { pin: otaPinInput.trim() },
+      });
+      if (!error && data?.ok) {
+        setOtaUnlocked(true);
+      } else {
+        setOtaPinError(true);
+      }
+    } catch {
+      setOtaPinError(true);
+    } finally {
+      setOtaChecking(false);
+    }
+  };
 
   useEffect(() => {
     if (!supabase) return;
@@ -1194,48 +1224,82 @@ export default function App() {
             </div>
 
             <div>
-              <input
-                type="file"
-                accept=".bin"
-                onChange={(e) => setOtaFile(e.target.files?.[0] || null)}
-                className="w-full text-[13px] text-white/70 file:mr-3 file:py-2 file:px-3 file:rounded-xl file:border-0 file:bg-white/10 file:text-white/80 file:text-[12.5px] hover:file:bg-white/15 rounded-xl bg-white/5 border border-white/10 px-3 py-2"
-              />
-              <input
-                value={otaVersion}
-                onChange={(e) => setOtaVersion(e.target.value)}
-                placeholder="Nomor versi, mis. 1.0.1"
-                className="w-full mt-2.5 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[13px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40"
-              />
-              <textarea
-                value={otaNotes}
-                onChange={(e) => setOtaNotes(e.target.value)}
-                placeholder="Catatan perubahan (opsional)"
-                rows={2}
-                className="w-full mt-2.5 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[13px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40 resize-none"
-              />
-              <button
-                onClick={handleOtaUpload}
-                disabled={!supaConfigured || !otaFile || !otaVersion.trim() || otaStatus === "uploading"}
-                className="mt-2.5 w-full py-2.5 rounded-xl bg-cyan-300/15 border border-cyan-300/25 text-cyan-200 text-[13px] hover:bg-cyan-300/25 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                <UploadCloud size={14} />
-                {otaStatus === "uploading" ? "Mengupload…" : "Upload firmware"}
-              </button>
+              {!otaUnlocked ? (
+                <div className="h-full flex flex-col items-center justify-center text-center rounded-2xl bg-white/[0.04] border border-white/[0.06] px-5 py-8">
+                  <div className="h-10 w-10 rounded-full bg-white/5 border border-white/10 flex items-center justify-center mb-3">
+                    <Lock size={16} className="text-white/50" />
+                  </div>
+                  <div className="text-[13px] text-white/70 mb-3">Masukkan PIN untuk membuka panel upload</div>
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    value={otaPinInput}
+                    onChange={(e) => {
+                      setOtaPinInput(e.target.value);
+                      setOtaPinError(false);
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && handleUnlockOta()}
+                    placeholder="PIN"
+                    className="w-full max-w-[160px] text-center tracking-[0.3em] rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[15px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40"
+                  />
+                  <button
+                    onClick={handleUnlockOta}
+                    disabled={!supaConfigured || otaChecking || !otaPinInput.trim()}
+                    className="mt-3 px-4 py-2 rounded-xl bg-cyan-300/15 border border-cyan-300/25 text-cyan-200 text-[13px] hover:bg-cyan-300/25 transition-colors flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Unlock size={13} />
+                    {otaChecking ? "Memeriksa…" : "Buka"}
+                  </button>
+                  {otaPinError && (
+                    <div className="mt-2.5 text-[12px] text-rose-300">PIN salah, coba lagi.</div>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <input
+                    type="file"
+                    accept=".bin"
+                    onChange={(e) => setOtaFile(e.target.files?.[0] || null)}
+                    className="w-full text-[13px] text-white/70 file:mr-3 file:py-2 file:px-3 file:rounded-xl file:border-0 file:bg-white/10 file:text-white/80 file:text-[12.5px] hover:file:bg-white/15 rounded-xl bg-white/5 border border-white/10 px-3 py-2"
+                  />
+                  <input
+                    value={otaVersion}
+                    onChange={(e) => setOtaVersion(e.target.value)}
+                    placeholder="Nomor versi, mis. 1.0.1"
+                    className="w-full mt-2.5 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[13px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40"
+                  />
+                  <textarea
+                    value={otaNotes}
+                    onChange={(e) => setOtaNotes(e.target.value)}
+                    placeholder="Catatan perubahan (opsional)"
+                    rows={2}
+                    className="w-full mt-2.5 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[13px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40 resize-none"
+                  />
+                  <button
+                    onClick={handleOtaUpload}
+                    disabled={!supaConfigured || !otaFile || !otaVersion.trim() || otaStatus === "uploading"}
+                    className="mt-2.5 w-full py-2.5 rounded-xl bg-cyan-300/15 border border-cyan-300/25 text-cyan-200 text-[13px] hover:bg-cyan-300/25 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <UploadCloud size={14} />
+                    {otaStatus === "uploading" ? "Mengupload…" : "Upload firmware"}
+                  </button>
 
-              {otaStatus === "success" && (
-                <div className="mt-2.5 flex items-center gap-1.5 text-[12.5px] text-emerald-300">
-                  <CheckCircle2 size={13} /> Berhasil diupload, ESP32 akan mengambilnya di siklus cek berikutnya.
-                </div>
+                  {otaStatus === "success" && (
+                    <div className="mt-2.5 flex items-center gap-1.5 text-[12.5px] text-emerald-300">
+                      <CheckCircle2 size={13} /> Berhasil diupload, ESP32 akan mengambilnya di siklus cek berikutnya.
+                    </div>
+                  )}
+                  {otaStatus === "error" && (
+                    <div className="mt-2.5 flex items-center gap-1.5 text-[12.5px] text-rose-300">
+                      <AlertCircle size={13} /> {otaError}
+                    </div>
+                  )}
+                  <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
+                    Naikkan <code>FIRMWARE_VERSION</code> di sketch ESP32 sebelum compile file .bin
+                    yang mau diupload, supaya device bisa membedakan ini firmware baru atau bukan.
+                  </p>
+                </>
               )}
-              {otaStatus === "error" && (
-                <div className="mt-2.5 flex items-center gap-1.5 text-[12.5px] text-rose-300">
-                  <AlertCircle size={13} /> {otaError}
-                </div>
-              )}
-              <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
-                Naikkan <code>FIRMWARE_VERSION</code> di sketch ESP32 sebelum compile file .bin
-                yang mau diupload, supaya device bisa membedakan ini firmware baru atau bukan.
-              </p>
             </div>
           </div>
         </Glass>
