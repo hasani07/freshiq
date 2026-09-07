@@ -761,15 +761,37 @@ export default function App() {
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "camera_snapshots" },
         (payload) => {
-          setLatestSnapshot(payload.new);
-          if (snapshotInCurrentFilter(payload.new)) {
+          const snapshot = payload.new;
+          if (!snapshot?.url || !snapshot?.captured_at) return;
+
+          setLatestSnapshot(snapshot);
+
+          if (snapshotInCurrentFilter(snapshot)) {
             const cap = snapshotFilterMode === "latest" ? SNAPSHOT_HISTORY_LIMIT : 300;
-            setSnapshotHistory((h) => [payload.new, ...h].slice(0, cap));
+            setSnapshotHistory((h) => {
+              const withoutDuplicate = h.filter((item) => item.captured_at !== snapshot.captured_at);
+              return [snapshot, ...withoutDuplicate].slice(0, cap);
+            });
           }
-          setSnapshotWaiting(false);
+
+          // Hanya anggap selesai kalau foto ini memang dibuat SETELAH
+          // tombol "Ambil sekarang" ditekan. Snapshot interval lama tidak
+          // boleh mematikan indikator "menunggu".
+          const requestedAt = snapshotRequestedAtRef.current;
+          if (requestedAt) {
+            const isNewCapture =
+              new Date(snapshot.captured_at).getTime() >= new Date(requestedAt).getTime();
+
+            if (isNewCapture) {
+              setSnapshotWaiting(false);
+              setSnapshotTimedOut(false);
+            }
+          }
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        console.log("Status realtime camera_snapshots:", status);
+      });
 
     return () => {
       supabase.removeChannel(channel);
@@ -780,17 +802,87 @@ export default function App() {
 
   const handleCaptureNow = async () => {
     if (!supabase) return;
+
     const requestTime = new Date().toISOString();
     snapshotRequestedAtRef.current = requestTime;
+
     setSnapshotWaiting(true);
     setSnapshotTimedOut(false);
     setSnapshotCommandError("");
-    const { error } = await supabase.from("camera_command").upsert({ id: 1, capture_requested_at: requestTime });
+
+    const { error } = await supabase
+      .from("camera_command")
+      .upsert({
+        id: 1,
+        capture_requested_at: requestTime,
+      });
+
     if (error) {
       console.error("Gagal kirim perintah capture:", error);
       setSnapshotWaiting(false);
-      setSnapshotCommandError(error.message || "Gagal mengirim perintah ke Supabase");
+      setSnapshotCommandError(
+        error.message || "Gagal mengirim perintah ke Supabase"
+      );
+      return;
     }
+
+    console.log("Perintah capture terkirim:", requestTime);
+
+    // Realtime tetap dipakai, tetapi polling ini menjadi BACKUP.
+    // Jadi dashboard tetap akan mendapatkan foto walaupun event Realtime
+    // terlambat/tidak masuk ke browser.
+    let attempts = 0;
+    const maxAttempts = 30; // 30 x 2 detik = 60 detik
+
+    const pollId = setInterval(async () => {
+      attempts++;
+
+      const { data, error: queryError } = await supabase
+        .from("camera_snapshots")
+        .select("url,source,captured_at")
+        .order("captured_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (queryError) {
+        console.error("Gagal cek snapshot terbaru:", queryError);
+      }
+
+      if (data?.captured_at) {
+        const requestMs = new Date(requestTime).getTime();
+        const snapshotMs = new Date(data.captured_at).getTime();
+
+        if (snapshotMs >= requestMs) {
+          console.log("Snapshot baru ditemukan lewat polling:", data);
+
+          setLatestSnapshot(data);
+
+          setSnapshotHistory((prev) => {
+            const withoutDuplicate = prev.filter(
+              (item) => item.captured_at !== data.captured_at
+            );
+            return [data, ...withoutDuplicate].slice(
+              0,
+              SNAPSHOT_HISTORY_LIMIT
+            );
+          });
+
+          setSnapshotWaiting(false);
+          setSnapshotTimedOut(false);
+          clearInterval(pollId);
+          snapshotRequestedAtRef.current = null;
+          return;
+        }
+      }
+
+      if (attempts >= maxAttempts) {
+        clearInterval(pollId);
+        setSnapshotWaiting(false);
+        setSnapshotTimedOut(true);
+        console.warn("Timeout menunggu snapshot baru dari ESP32-CAM");
+        snapshotRequestedAtRef.current = null;
+      }
+    }, 2000);
   };
 
   useEffect(() => {
