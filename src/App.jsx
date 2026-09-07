@@ -624,39 +624,27 @@ export default function App() {
   }, [supabase, wifiTarget]);
 
   // ------ Log perangkat jarak jauh (pengganti Serial Monitor) ------
+  // Sengaja gak auto-update terus-terusan — cuma narik data pas tombol "Lihat Log" diklik,
+  // biar mirip buka Serial Monitor manual, bukan live-feed yang jalan sendiri.
   const [logTarget, setLogTarget] = useState("sensor"); // pakai key yang sama dengan WIFI_TARGETS/OTA_TARGETS
   const [deviceLogs, setDeviceLogs] = useState([]);
+  const [logLoading, setLogLoading] = useState(false);
+  const [logFetchedAt, setLogFetchedAt] = useState(null);
   const LOG_LIMIT = 50;
 
-  useEffect(() => {
+  const handleFetchLogs = async () => {
     if (!supabase) return;
-    const deviceId = WIFI_TARGETS[logTarget].id;
-
-    supabase
+    setLogLoading(true);
+    const { data } = await supabase
       .from("device_logs")
       .select("message,created_at")
-      .eq("device_id", deviceId)
+      .eq("device_id", WIFI_TARGETS[logTarget].id)
       .order("created_at", { ascending: false })
-      .limit(LOG_LIMIT)
-      .then(({ data }) => setDeviceLogs(data || []));
-
-    const channel = supabase
-      .channel("device-logs-live")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "device_logs" },
-        (payload) => {
-          if (payload.new.device_id === deviceId) {
-            setDeviceLogs((l) => [payload.new, ...l].slice(0, LOG_LIMIT));
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [supabase, logTarget]);
+      .limit(LOG_LIMIT);
+    setDeviceLogs(data || []);
+    setLogFetchedAt(new Date());
+    setLogLoading(false);
+  };
 
   // ------ Status online/offline ESP32-CAM (heartbeat tiap 10 detik) ------
   const [camLastSeen, setCamLastSeen] = useState(null);
@@ -2199,22 +2187,36 @@ export default function App() {
           <SectionTitle
             icon={Terminal}
             title="Log perangkat"
-            sub="Pengganti Serial Monitor — gak perlu colok USB buat lihat log"
+            sub="Pengganti Serial Monitor — klik untuk lihat log terbaru"
             action={
-              <div className="flex gap-1 rounded-full bg-white/5 border border-white/10 p-1">
-                {Object.entries(WIFI_TARGETS).map(([key, t]) => (
-                  <button
-                    key={key}
-                    onClick={() => setLogTarget(key)}
-                    className="px-3 py-1.5 rounded-full text-[12px] transition-colors"
-                    style={{
-                      background: logTarget === key ? "rgba(255,255,255,0.1)" : "transparent",
-                      color: logTarget === key ? "white" : "rgba(255,255,255,0.45)",
-                    }}
-                  >
-                    {t.label}
-                  </button>
-                ))}
+              <div className="flex items-center gap-2">
+                <div className="flex gap-1 rounded-full bg-white/5 border border-white/10 p-1">
+                  {Object.entries(WIFI_TARGETS).map(([key, t]) => (
+                    <button
+                      key={key}
+                      onClick={() => {
+                        setLogTarget(key);
+                        setDeviceLogs([]);
+                        setLogFetchedAt(null);
+                      }}
+                      className="px-3 py-1.5 rounded-full text-[12px] transition-colors"
+                      style={{
+                        background: logTarget === key ? "rgba(255,255,255,0.1)" : "transparent",
+                        color: logTarget === key ? "white" : "rgba(255,255,255,0.45)",
+                      }}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={handleFetchLogs}
+                  disabled={!supaConfigured || logLoading}
+                  className="h-8 px-3 rounded-full border border-cyan-300/25 bg-cyan-300/15 flex items-center gap-1.5 text-cyan-200 hover:bg-cyan-300/25 transition-colors text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <RotateCw size={13} className={logLoading ? "animate-spin" : ""} />
+                  {logLoading ? "Mengambil…" : "Lihat Log"}
+                </button>
               </div>
             }
           />
@@ -2222,7 +2224,11 @@ export default function App() {
             <div className="rounded-2xl bg-black/40 border border-white/10 p-4 h-[280px] overflow-y-auto font-mono text-[12px] leading-relaxed">
               {deviceLogs.length === 0 ? (
                 <div className="text-white/30">
-                  {supaConfigured ? "Belum ada log masuk." : "Sambungkan Supabase dulu untuk pakai fitur ini."}
+                  {!supaConfigured
+                    ? "Sambungkan Supabase dulu untuk pakai fitur ini."
+                    : logFetchedAt
+                    ? "Belum ada log masuk untuk device ini."
+                    : 'Klik "Lihat Log" untuk menampilkan log terbaru.'}
                 </div>
               ) : (
                 deviceLogs.map((l, i) => (
@@ -2234,9 +2240,10 @@ export default function App() {
               )}
             </div>
             <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
+              {logFetchedAt && `Terakhir diambil ${formatClock(logFetchedAt)}. `}
               Cuma nampilin kejadian penting (konek/putus WiFi, error, hasil OTA, dll), bukan semua baris
               yang biasanya muncul di Serial Monitor — biar gak boros kuota Supabase. Maks 50 baris
-              terakhir per device.
+              terakhir per device. Log tidak auto-refresh — klik "Lihat Log" lagi kalau mau lihat yang terbaru.
             </p>
           </div>
         </Glass>
