@@ -42,6 +42,8 @@ import {
   SignalMedium,
   SignalLow,
   SignalZero,
+  Sun,
+  BatteryCharging,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -77,6 +79,12 @@ const METRICS = {
     key: "voc",
   },
 };
+
+// Panel surya diperlakukan terpisah dari METRICS di atas (bukan bagian dari
+// kartu ring/rentang ideal/deteksi busuk) karena maknanya beda — ini soal
+// kesehatan catu daya, bukan kondisi lingkungan box.
+const PANEL_BOUNDS = [0, 24]; // sesuaikan dengan spesifikasi panel surya kamu (mis. panel 18V/20V)
+const PANEL_COLOR = "#fbbf24";
 
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 
@@ -378,18 +386,20 @@ const DEFAULT_THRESHOLDS = {
 
 export default function App() {
   const [now, setNow] = useState(new Date());
-  const [current, setCurrent] = useState({ suhu: 26.5, lembap: 58, voc: 180, rssi: null });
+  const [current, setCurrent] = useState({ suhu: 26.5, lembap: 58, voc: 180, rssi: null, tegangan_panel: 12.6 });
   const [history, setHistory] = useState(() => {
     const arr = [];
     let s = 26.5,
       l = 58,
-      v = 180;
+      v = 180,
+      p = 12.6;
     const nowMs = Date.now();
     for (let i = 0; i < HISTORY_LEN; i++) {
       s = nextWalk(s, METRICS.suhu.bounds, 1.2, 0.01);
       l = nextWalk(l, METRICS.lembap.bounds, 2.5, 0.01);
       v = nextWalk(v, METRICS.voc.bounds, 25, 0.02);
-      arr.push({ t: i, time: nowMs - (HISTORY_LEN - 1 - i) * 2200, suhu: s, lembap: l, voc: v });
+      p = nextWalk(p, PANEL_BOUNDS, 0.3, 0.02);
+      arr.push({ t: i, time: nowMs - (HISTORY_LEN - 1 - i) * 2200, suhu: s, lembap: l, voc: v, tegangan_panel: p });
     }
     return arr;
   });
@@ -778,6 +788,7 @@ export default function App() {
           suhu: nextWalk(prev.suhu, METRICS.suhu.bounds, 1.1, 0.02),
           lembap: nextWalk(prev.lembap, METRICS.lembap.bounds, 2.2, 0.02),
           voc: nextWalk(prev.voc, METRICS.voc.bounds, 22, 0.025),
+          tegangan_panel: nextWalk(prev.tegangan_panel ?? 12.6, PANEL_BOUNDS, 0.35, 0.03),
         };
 
         // logika kipas: histeresis sederhana berbasis suhu & VOC
@@ -813,7 +824,7 @@ export default function App() {
     async function loadHistory() {
       const { data, error } = await supabase
         .from("sensor_readings")
-        .select("suhu,lembap,voc,rssi,created_at")
+        .select("suhu,lembap,voc,rssi,tegangan_panel,created_at")
         .order("created_at", { ascending: false })
         .limit(HISTORY_LEN);
 
@@ -824,7 +835,14 @@ export default function App() {
       }
       const ordered = [...data].reverse();
       setHistory(
-        ordered.map((r, i) => ({ t: i, time: new Date(r.created_at).getTime(), suhu: r.suhu, lembap: r.lembap, voc: r.voc }))
+        ordered.map((r, i) => ({
+          t: i,
+          time: new Date(r.created_at).getTime(),
+          suhu: r.suhu,
+          lembap: r.lembap,
+          voc: r.voc,
+          tegangan_panel: r.tegangan_panel,
+        }))
       );
       setCurrent(ordered[ordered.length - 1]);
       setLastUpdate(new Date(ordered[ordered.length - 1].created_at));
@@ -851,6 +869,7 @@ export default function App() {
               suhu: next.suhu,
               lembap: next.lembap,
               voc: next.voc,
+              tegangan_panel: next.tegangan_panel,
             };
             return [...h.slice(1), point];
           });
@@ -1661,6 +1680,71 @@ export default function App() {
             <div className="flex items-center gap-1.5 text-[11.5px] text-white/30 pt-1">
               <ChevronRight size={13} />
               Perubahan diterapkan langsung ke logika kipas dan grafik
+            </div>
+          </div>
+        </Glass>
+      </div>
+
+      {/* panel surya */}
+      <div className="mx-auto max-w-[1360px] px-6 mt-5">
+        <Glass>
+          <SectionTitle icon={Sun} title="Panel surya" sub="Tegangan hasil voltage divider di ESP32" />
+          <div className="px-6 pb-6 pt-3 grid md:grid-cols-[auto_1fr] gap-6 items-center">
+            <div className="flex items-center gap-3 md:pr-6 md:border-r border-white/10">
+              <div
+                className="h-12 w-12 rounded-2xl flex items-center justify-center border shrink-0"
+                style={{ borderColor: `${PANEL_COLOR}40`, background: `${PANEL_COLOR}18` }}
+              >
+                <BatteryCharging size={20} style={{ color: PANEL_COLOR }} />
+              </div>
+              <div>
+                <div
+                  className="text-[30px] leading-none font-semibold tabular"
+                  style={{ fontFamily: "'Space Grotesk', sans-serif" }}
+                >
+                  {current.tegangan_panel != null ? current.tegangan_panel.toFixed(1) : "-"}
+                  <span className="text-[15px] text-white/40 ml-1">V</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="h-[140px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="fillPanel" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={PANEL_COLOR} stopOpacity={0.4} />
+                      <stop offset="100%" stopColor={PANEL_COLOR} stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                  <XAxis dataKey="time" type="number" domain={["dataMin", "dataMax"]} scale="time" hide />
+                  <YAxis
+                    domain={PANEL_BOUNDS}
+                    tick={{ fill: "rgba(255,255,255,0.35)", fontSize: 11 }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={30}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: "rgba(10,16,28,0.92)",
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      borderRadius: 12,
+                      fontSize: 12.5,
+                    }}
+                    labelFormatter={(label) => formatClock(new Date(label))}
+                    formatter={(v) => [`${v?.toFixed ? v.toFixed(2) : v} V`, "Panel surya"]}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="tegangan_panel"
+                    stroke={PANEL_COLOR}
+                    strokeWidth={2.2}
+                    fill="url(#fillPanel)"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
             </div>
           </div>
         </Glass>
