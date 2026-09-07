@@ -44,6 +44,7 @@ import {
   SignalZero,
   Sun,
   BatteryCharging,
+  Terminal,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -621,6 +622,41 @@ export default function App() {
       supabase.removeChannel(channel);
     };
   }, [supabase, wifiTarget]);
+
+  // ------ Log perangkat jarak jauh (pengganti Serial Monitor) ------
+  const [logTarget, setLogTarget] = useState("sensor"); // pakai key yang sama dengan WIFI_TARGETS/OTA_TARGETS
+  const [deviceLogs, setDeviceLogs] = useState([]);
+  const LOG_LIMIT = 50;
+
+  useEffect(() => {
+    if (!supabase) return;
+    const deviceId = WIFI_TARGETS[logTarget].id;
+
+    supabase
+      .from("device_logs")
+      .select("message,created_at")
+      .eq("device_id", deviceId)
+      .order("created_at", { ascending: false })
+      .limit(LOG_LIMIT)
+      .then(({ data }) => setDeviceLogs(data || []));
+
+    const channel = supabase
+      .channel("device-logs-live")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "device_logs" },
+        (payload) => {
+          if (payload.new.device_id === deviceId) {
+            setDeviceLogs((l) => [payload.new, ...l].slice(0, LOG_LIMIT));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, logTarget]);
 
   // ------ Status online/offline ESP32-CAM (heartbeat tiap 10 detik) ------
   const [camLastSeen, setCamLastSeen] = useState(null);
@@ -2153,6 +2189,55 @@ export default function App() {
                 </>
               )}
             </div>
+          </div>
+        </Glass>
+      </div>
+
+      {/* log perangkat (pengganti Serial Monitor) */}
+      <div className="mx-auto max-w-[1360px] px-6 mt-5">
+        <Glass>
+          <SectionTitle
+            icon={Terminal}
+            title="Log perangkat"
+            sub="Pengganti Serial Monitor — gak perlu colok USB buat lihat log"
+            action={
+              <div className="flex gap-1 rounded-full bg-white/5 border border-white/10 p-1">
+                {Object.entries(WIFI_TARGETS).map(([key, t]) => (
+                  <button
+                    key={key}
+                    onClick={() => setLogTarget(key)}
+                    className="px-3 py-1.5 rounded-full text-[12px] transition-colors"
+                    style={{
+                      background: logTarget === key ? "rgba(255,255,255,0.1)" : "transparent",
+                      color: logTarget === key ? "white" : "rgba(255,255,255,0.45)",
+                    }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            }
+          />
+          <div className="px-6 pb-6 pt-3">
+            <div className="rounded-2xl bg-black/40 border border-white/10 p-4 h-[280px] overflow-y-auto font-mono text-[12px] leading-relaxed">
+              {deviceLogs.length === 0 ? (
+                <div className="text-white/30">
+                  {supaConfigured ? "Belum ada log masuk." : "Sambungkan Supabase dulu untuk pakai fitur ini."}
+                </div>
+              ) : (
+                deviceLogs.map((l, i) => (
+                  <div key={l.created_at + i} className="flex gap-2 text-white/70">
+                    <span className="text-white/30 shrink-0 tabular">{formatClock(new Date(l.created_at))}</span>
+                    <span className="break-all">{l.message}</span>
+                  </div>
+                ))
+              )}
+            </div>
+            <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
+              Cuma nampilin kejadian penting (konek/putus WiFi, error, hasil OTA, dll), bukan semua baris
+              yang biasanya muncul di Serial Monitor — biar gak boros kuota Supabase. Maks 50 baris
+              terakhir per device.
+            </p>
           </div>
         </Glass>
       </div>
