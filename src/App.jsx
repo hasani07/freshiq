@@ -515,24 +515,74 @@ export default function App() {
 
   // ------ Snapshot kamera (akses dari mana saja, tanpa port forwarding/Tailscale) ------
   const [latestSnapshot, setLatestSnapshot] = useState(null); // { url, source, captured_at }
+  const [snapshotHistory, setSnapshotHistory] = useState([]); // hasil filter saat ini, terbaru dulu
   const [snapshotWaiting, setSnapshotWaiting] = useState(false);
   const [snapshotTimedOut, setSnapshotTimedOut] = useState(false);
+  const [snapshotViewing, setSnapshotViewing] = useState(null); // snapshot yang lagi dilihat gede
   const snapshotRequestedAtRef = useRef(null);
+
+  const SNAPSHOT_HISTORY_LIMIT = 16; // dipakai kalau filter = "latest" (tanpa rentang tanggal)
+
+  // filter riwayat: "latest" (16 terakhir) | "1"/"3"/"7" (n hari terakhir) | "date" (tanggal tertentu)
+  const [snapshotFilterMode, setSnapshotFilterMode] = useState("latest");
+  const [snapshotFilterDate, setSnapshotFilterDate] = useState("");
+
+  const snapshotInCurrentFilter = useCallback(
+    (item) => {
+      const t = new Date(item.captured_at).getTime();
+      if (snapshotFilterMode === "latest") return true;
+      if (snapshotFilterMode === "date") {
+        if (!snapshotFilterDate) return false;
+        const d = new Date(item.captured_at);
+        const [y, m, dd] = snapshotFilterDate.split("-").map(Number);
+        return d.getFullYear() === y && d.getMonth() + 1 === m && d.getDate() === dd;
+      }
+      const days = Number(snapshotFilterMode);
+      return Date.now() - t <= days * 24 * 60 * 60 * 1000;
+    },
+    [snapshotFilterMode, snapshotFilterDate]
+  );
+
+  const fetchSnapshotHistory = useCallback(async () => {
+    if (!supabase) return;
+    let query = supabase
+      .from("camera_snapshots")
+      .select("url,source,captured_at")
+      .order("captured_at", { ascending: false });
+
+    if (snapshotFilterMode === "date" && snapshotFilterDate) {
+      const start = `${snapshotFilterDate}T00:00:00`;
+      const end = `${snapshotFilterDate}T23:59:59.999`;
+      query = query.gte("captured_at", start).lte("captured_at", end);
+    } else if (snapshotFilterMode !== "latest") {
+      const days = Number(snapshotFilterMode);
+      const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+      query = query.gte("captured_at", start).limit(300);
+    } else {
+      query = query.limit(SNAPSHOT_HISTORY_LIMIT);
+    }
+
+    const { data } = await query;
+    setSnapshotHistory(data || []);
+  }, [supabase, snapshotFilterMode, snapshotFilterDate]);
+
+  useEffect(() => {
+    fetchSnapshotHistory();
+  }, [fetchSnapshotHistory]);
 
   useEffect(() => {
     if (!supabase) return;
-    let cancelled = false;
 
-    async function loadLatest() {
-      const { data } = await supabase
-        .from("camera_snapshots")
-        .select("url,source,captured_at")
-        .order("captured_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (!cancelled && data) setLatestSnapshot(data);
-    }
-    loadLatest();
+    // ambil foto TERBARU secara umum (independen dari filter), untuk tampilan utama
+    supabase
+      .from("camera_snapshots")
+      .select("url,source,captured_at")
+      .order("captured_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data) setLatestSnapshot(data);
+      });
 
     const channel = supabase
       .channel("camera-snapshots-live")
@@ -541,16 +591,18 @@ export default function App() {
         { event: "INSERT", schema: "public", table: "camera_snapshots" },
         (payload) => {
           setLatestSnapshot(payload.new);
+          if (snapshotInCurrentFilter(payload.new)) {
+            setSnapshotHistory((h) => [payload.new, ...h]);
+          }
           setSnapshotWaiting(false);
         }
       )
       .subscribe();
 
     return () => {
-      cancelled = true;
       supabase.removeChannel(channel);
     };
-  }, [supabase]);
+  }, [supabase, snapshotInCurrentFilter]);
 
   const handleCaptureNow = async () => {
     if (!supabase) return;
@@ -1301,10 +1353,10 @@ export default function App() {
           />
           <div className="px-6 pb-6 pt-3">
             <div className="aspect-video rounded-2xl bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center">
-              {latestSnapshot ? (
+              {snapshotViewing || latestSnapshot ? (
                 <img
-                  src={latestSnapshot.url}
-                  alt="Snapshot terakhir box"
+                  src={(snapshotViewing || latestSnapshot).url}
+                  alt="Snapshot box"
                   className="w-full h-full object-cover"
                 />
               ) : (
@@ -1316,19 +1368,90 @@ export default function App() {
             </div>
             <div className="mt-3 flex items-center justify-between text-[12.5px] text-white/40">
               <span>
-                {latestSnapshot
-                  ? `Diambil ${formatRelative(Math.floor((nowTick - new Date(latestSnapshot.captured_at).getTime()) / 1000))} · ${latestSnapshot.source === "manual" ? "manual" : "otomatis"}`
+                {snapshotViewing || latestSnapshot
+                  ? `${formatClock(new Date((snapshotViewing || latestSnapshot).captured_at))} · ${
+                      (snapshotViewing || latestSnapshot).source === "manual" ? "manual" : "otomatis"
+                    }${snapshotViewing && latestSnapshot && snapshotViewing.captured_at !== latestSnapshot.captured_at ? " · sedang lihat riwayat" : ""}`
                   : "—"}
               </span>
-              {snapshotTimedOut && (
-                <span className="text-rose-300">ESP32-CAM tidak merespons, coba lagi.</span>
-              )}
+              <div className="flex items-center gap-2">
+                {snapshotTimedOut && <span className="text-rose-300">ESP32-CAM tidak merespons, coba lagi.</span>}
+                {snapshotViewing && (
+                  <button
+                    onClick={() => setSnapshotViewing(null)}
+                    className="text-cyan-300 hover:text-cyan-200 transition-colors"
+                  >
+                    Kembali ke terbaru
+                  </button>
+                )}
+              </div>
             </div>
+
+            {supaConfigured && (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                {[
+                  { key: "latest", label: "Terbaru" },
+                  { key: "1", label: "1 hari" },
+                  { key: "3", label: "3 hari" },
+                  { key: "7", label: "7 hari" },
+                ].map((f) => (
+                  <button
+                    key={f.key}
+                    onClick={() => {
+                      setSnapshotFilterMode(f.key);
+                      setSnapshotFilterDate("");
+                    }}
+                    className="px-3 py-1.5 rounded-full text-[12px] transition-colors"
+                    style={{
+                      background: snapshotFilterMode === f.key ? "rgba(94,200,216,0.18)" : "rgba(255,255,255,0.05)",
+                      color: snapshotFilterMode === f.key ? "#5ec8d8" : "rgba(255,255,255,0.5)",
+                      border: `1px solid ${snapshotFilterMode === f.key ? "rgba(94,200,216,0.3)" : "rgba(255,255,255,0.08)"}`,
+                    }}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+                <input
+                  type="date"
+                  value={snapshotFilterDate}
+                  onChange={(e) => {
+                    setSnapshotFilterDate(e.target.value);
+                    setSnapshotFilterMode("date");
+                  }}
+                  className="px-3 py-1.5 rounded-full text-[12px] bg-white/5 border border-white/10 text-white/70 outline-none focus:border-cyan-300/40"
+                  style={{ colorScheme: "dark" }}
+                />
+              </div>
+            )}
+
+            {snapshotHistory.length > 0 ? (
+              <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+                {snapshotHistory.map((snap, i) => (
+                  <button
+                    key={snap.captured_at + i}
+                    onClick={() => setSnapshotViewing(snap)}
+                    className="shrink-0 h-14 w-20 rounded-lg overflow-hidden border-2 transition-colors"
+                    style={{
+                      borderColor:
+                        (snapshotViewing || latestSnapshot)?.captured_at === snap.captured_at
+                          ? "rgba(94,200,216,0.8)"
+                          : "rgba(255,255,255,0.1)",
+                    }}
+                    title={formatClock(new Date(snap.captured_at))}
+                  >
+                    <img src={snap.url} alt="" className="w-full h-full object-cover" />
+                  </button>
+                ))}
+              </div>
+            ) : snapshotFilterMode !== "latest" ? (
+              <div className="mt-3 text-[12.5px] text-white/30">Tidak ada snapshot pada rentang/tanggal ini.</div>
+            ) : null}
+
             <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
               ESP32-CAM ambil foto otomatis tiap 30 menit dan upload ke Supabase — jalan lewat internet
               biasa, tidak butuh port forwarding, Tailscale, atau berada di jaringan yang sama. Tombol
-              "Ambil sekarang" minta ESP32-CAM memotret di luar jadwal itu; prosesnya butuh beberapa
-              detik sampai semenit tergantung kecepatan internet box.
+              "Ambil sekarang" minta ESP32-CAM memotret di luar jadwal itu. Klik salah satu thumbnail di
+              bawah untuk lihat riwayat {SNAPSHOT_HISTORY_LIMIT} foto terakhir.
             </p>
           </div>
         </Glass>
