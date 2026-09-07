@@ -723,13 +723,21 @@ export default function App() {
     };
   }, [supabase, snapshotInCurrentFilter, snapshotFilterMode]);
 
+  const [snapshotCommandError, setSnapshotCommandError] = useState("");
+
   const handleCaptureNow = async () => {
     if (!supabase) return;
     const requestTime = new Date().toISOString();
     snapshotRequestedAtRef.current = requestTime;
     setSnapshotWaiting(true);
     setSnapshotTimedOut(false);
-    await supabase.from("camera_command").upsert({ id: 1, capture_requested_at: requestTime });
+    setSnapshotCommandError("");
+    const { error } = await supabase.from("camera_command").upsert({ id: 1, capture_requested_at: requestTime });
+    if (error) {
+      console.error("Gagal kirim perintah capture:", error);
+      setSnapshotWaiting(false);
+      setSnapshotCommandError(error.message || "Gagal mengirim perintah ke Supabase");
+    }
   };
 
   useEffect(() => {
@@ -1677,6 +1685,9 @@ export default function App() {
               </span>
               <div className="flex items-center gap-2">
                 {snapshotTimedOut && <span className="text-rose-300">ESP32-CAM tidak merespons, coba lagi.</span>}
+                {snapshotCommandError && (
+                  <span className="text-rose-300">Gagal kirim perintah: {snapshotCommandError}</span>
+                )}
                 {snapshotViewing && (
                   <button
                     onClick={() => setSnapshotViewing(null)}
