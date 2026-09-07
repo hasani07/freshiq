@@ -264,7 +264,7 @@ function Glass({ children, className = "" }) {
 
 function SectionTitle({ icon: Icon, title, sub, action }) {
   return (
-    <div className="flex items-center justify-between px-6 pt-5">
+    <div className="flex items-center justify-between flex-wrap gap-2 px-6 pt-5">
       <div className="flex items-center gap-2.5">
         {Icon && <Icon size={17} strokeWidth={2} className="text-white/60" />}
         <div>
@@ -512,6 +512,41 @@ export default function App() {
       setOtaError(err.message || "Gagal upload firmware");
     }
   };
+
+  // ------ Status online/offline ESP32-CAM (heartbeat tiap 10 detik) ------
+  const [camLastSeen, setCamLastSeen] = useState(null);
+  const CAM_ONLINE_THRESHOLD_SEC = 30; // heartbeat tiap 10 detik, kasih margin 3x lipat
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    supabase
+      .from("camera_status")
+      .select("last_seen")
+      .eq("id", 1)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data?.last_seen) setCamLastSeen(new Date(data.last_seen));
+      });
+
+    const channel = supabase
+      .channel("camera-status-live")
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "camera_status" },
+        (payload) => {
+          if (payload.new?.last_seen) setCamLastSeen(new Date(payload.new.last_seen));
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [supabase]);
+
+  const camOnline =
+    supaConfigured && camLastSeen ? (nowTick - camLastSeen.getTime()) / 1000 < CAM_ONLINE_THRESHOLD_SEC : false;
 
   // ------ Snapshot kamera (akses dari mana saja, tanpa port forwarding/Tailscale) ------
   const [latestSnapshot, setLatestSnapshot] = useState(null); // { url, source, captured_at }
@@ -1341,14 +1376,28 @@ export default function App() {
             title="Snapshot kamera"
             sub="Foto berkala tiap 30 menit — bisa diakses dari mana saja, tanpa port forwarding"
             action={
-              <button
-                onClick={handleCaptureNow}
-                disabled={!supaConfigured || snapshotWaiting}
-                className="h-8 px-3 rounded-full border border-cyan-300/25 bg-cyan-300/15 flex items-center gap-1.5 text-cyan-200 hover:bg-cyan-300/25 transition-colors text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                <RotateCw size={13} className={snapshotWaiting ? "animate-spin" : ""} />
-                {snapshotWaiting ? "Menunggu ESP32-CAM…" : "Ambil sekarang"}
-              </button>
+              <div className="flex items-center gap-2">
+                <div
+                  className="flex items-center gap-1.5 rounded-full px-2.5 py-1 border text-[11.5px]"
+                  style={{
+                    color: camOnline ? "#6ee7b7" : "#fb7185",
+                    borderColor: camOnline ? "rgba(110,231,183,0.25)" : "rgba(251,113,133,0.25)",
+                    background: camOnline ? "rgba(110,231,183,0.08)" : "rgba(251,113,133,0.08)",
+                  }}
+                  title={camLastSeen ? `Heartbeat terakhir ${formatClock(camLastSeen)}` : "Belum ada heartbeat"}
+                >
+                  <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" />
+                  ESP32-CAM {camOnline ? "online" : "offline"}
+                </div>
+                <button
+                  onClick={handleCaptureNow}
+                  disabled={!supaConfigured || snapshotWaiting}
+                  className="h-8 px-3 rounded-full border border-cyan-300/25 bg-cyan-300/15 flex items-center gap-1.5 text-cyan-200 hover:bg-cyan-300/25 transition-colors text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <RotateCw size={13} className={snapshotWaiting ? "animate-spin" : ""} />
+                  {snapshotWaiting ? "Menunggu ESP32-CAM…" : "Ambil sekarang"}
+                </button>
+              </div>
             }
           />
           <div className="px-6 pb-6 pt-3">
