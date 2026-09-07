@@ -1000,7 +1000,7 @@ export default function App() {
     alerts.forEach((a) => {
       if (!notifiedRef.current.has(a.key)) {
         notifiedRef.current.add(a.key);
-        new Notification("FreshIQ", { body: a.text });
+        new Notification("FreshRay", { body: a.text });
       }
     });
     // hapus tanda kalau alert sudah tidak aktif lagi, biar bisa notif ulang kalau kejadian lagi nanti
@@ -1103,7 +1103,7 @@ export default function App() {
               </div>
               <div>
                 <div className="text-[16px] font-semibold tracking-tight" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>
-                  FreshIQ
+                  FreshRay
                 </div>
                 <div className="text-[12px] text-white/40 -mt-0.5">Kendali iklim box · ESP32</div>
               </div>
