@@ -620,7 +620,8 @@ export default function App() {
         (payload) => {
           setLatestSnapshot(payload.new);
           if (snapshotInCurrentFilter(payload.new)) {
-            setSnapshotHistory((h) => [payload.new, ...h]);
+            const cap = snapshotFilterMode === "latest" ? SNAPSHOT_HISTORY_LIMIT : 300;
+            setSnapshotHistory((h) => [payload.new, ...h].slice(0, cap));
           }
           setSnapshotWaiting(false);
         }
@@ -630,7 +631,7 @@ export default function App() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [supabase, snapshotInCurrentFilter]);
+  }, [supabase, snapshotInCurrentFilter, snapshotFilterMode]);
 
   const handleCaptureNow = async () => {
     if (!supabase) return;
