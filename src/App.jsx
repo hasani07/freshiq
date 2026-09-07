@@ -33,6 +33,11 @@ import {
   Camera,
   RotateCw,
   ShieldAlert,
+  Wifi,
+  WifiOff,
+  Bell,
+  BellOff,
+  AlertTriangle,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -506,6 +511,91 @@ export default function App() {
     }
   };
 
+  // ------ Update WiFi jarak jauh ------
+  // Sama seperti OTA: satu baris per device di wifi_config (id=1 sensor, id=2 cam).
+  // Device polling tabel ini sendiri; dashboard cuma menulis, tidak pernah menampilkan
+  // password yang tersimpan kembali ke layar (write-only dari sisi UI).
+  const WIFI_TARGETS = {
+    sensor: { id: 1, label: "ESP32 (Sensor + Kipas)" },
+    cam: { id: 2, label: "ESP32-CAM" },
+  };
+  const [wifiTarget, setWifiTarget] = useState("sensor");
+  const [wifiInfo, setWifiInfo] = useState(null); // { ssid, updated_at } — password sengaja tidak diambil
+  const [wifiSsid, setWifiSsid] = useState("");
+  const [wifiPassword, setWifiPassword] = useState("");
+  const [wifiStatus, setWifiStatus] = useState("idle"); // idle | saving | success | error
+  const [wifiError, setWifiError] = useState("");
+
+  useEffect(() => {
+    if (!supabase) return;
+    let cancelled = false;
+    setWifiInfo(null);
+    supabase
+      .from("wifi_config")
+      .select("ssid,updated_at")
+      .eq("id", WIFI_TARGETS[wifiTarget].id)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!cancelled && data) setWifiInfo(data);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase, wifiStatus, wifiTarget]);
+
+  const handleWifiSave = async () => {
+    if (!supabase || !wifiSsid.trim() || !wifiPassword.trim()) return;
+    setWifiStatus("saving");
+    setWifiError("");
+    try {
+      const { error } = await supabase.from("wifi_config").upsert({
+        id: WIFI_TARGETS[wifiTarget].id,
+        ssid: wifiSsid.trim(),
+        password: wifiPassword,
+        updated_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      setWifiStatus("success");
+      setWifiSsid("");
+      setWifiPassword("");
+    } catch (err) {
+      setWifiStatus("error");
+      setWifiError(err.message || "Gagal menyimpan konfigurasi WiFi");
+    }
+  };
+
+  // riwayat percobaan ganti WiFi (berhasil/gagal-rollback), per device yang dipilih di tab
+  const [wifiHistory, setWifiHistory] = useState([]);
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    supabase
+      .from("wifi_history")
+      .select("ssid_dicoba,berhasil,ssid_aktif,created_at")
+      .eq("device_id", WIFI_TARGETS[wifiTarget].id)
+      .order("created_at", { ascending: false })
+      .limit(5)
+      .then(({ data }) => setWifiHistory(data || []));
+
+    const channel = supabase
+      .channel("wifi-history-live")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "wifi_history" },
+        (payload) => {
+          if (payload.new.device_id === WIFI_TARGETS[wifiTarget].id) {
+            setWifiHistory((h) => [payload.new, ...h].slice(0, 5));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [supabase, wifiTarget]);
+
   // ------ Status online/offline ESP32-CAM (heartbeat tiap 10 detik) ------
   const [camLastSeen, setCamLastSeen] = useState(null);
   const CAM_ONLINE_THRESHOLD_SEC = 30; // heartbeat tiap 10 detik, kasih margin 3x lipat
@@ -886,6 +976,46 @@ export default function App() {
     return min < max ? [min, max] : activeMetric.bounds;
   }, [chartData, activeMin, activeMax, activeMetric]);
 
+  // ------ Peringatan: buah busuk / device offline ------
+  const alerts = useMemo(() => {
+    const list = [];
+    if (busukStatus.level === "tinggi") {
+      list.push({ key: "busuk", text: `Buah terdeteksi BUSUK — ${busukStatus.reason}` });
+    }
+    if (supaConfigured && !deviceOnline) {
+      list.push({ key: "device-offline", text: "ESP32 (sensor + kipas) offline — tidak ada data baru." });
+    }
+    if (supaConfigured && camLastSeen && !camOnline) {
+      list.push({ key: "cam-offline", text: "ESP32-CAM offline — heartbeat terakhir terlalu lama." });
+    }
+    return list;
+  }, [busukStatus, supaConfigured, deviceOnline, camOnline, camLastSeen]);
+
+  // notifikasi browser (opsional) — sekali per kejadian, bukan tiap render
+  const [notifEnabled, setNotifEnabled] = useState(false);
+  const notifiedRef = useRef(new Set());
+
+  useEffect(() => {
+    if (!notifEnabled || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    alerts.forEach((a) => {
+      if (!notifiedRef.current.has(a.key)) {
+        notifiedRef.current.add(a.key);
+        new Notification("FreshIQ", { body: a.text });
+      }
+    });
+    // hapus tanda kalau alert sudah tidak aktif lagi, biar bisa notif ulang kalau kejadian lagi nanti
+    const activeKeys = new Set(alerts.map((a) => a.key));
+    notifiedRef.current.forEach((k) => {
+      if (!activeKeys.has(k)) notifiedRef.current.delete(k);
+    });
+  }, [alerts, notifEnabled]);
+
+  const handleEnableNotif = async () => {
+    if (typeof Notification === "undefined") return;
+    const perm = await Notification.requestPermission();
+    setNotifEnabled(perm === "granted");
+  };
+
   return (
     <div
       className="min-h-screen w-full text-white pb-16"
@@ -999,6 +1129,13 @@ export default function App() {
                 </div>
               )}
               <button
+                onClick={handleEnableNotif}
+                className="h-8 w-8 rounded-full border border-white/10 bg-white/5 flex items-center justify-center text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors"
+                title={notifEnabled ? "Notifikasi browser aktif" : "Aktifkan notifikasi browser"}
+              >
+                {notifEnabled ? <Bell size={14} /> : <BellOff size={14} />}
+              </button>
+              <button
                 onClick={() => setSupaOpen((v) => !v)}
                 className="h-8 w-8 rounded-full border border-white/10 bg-white/5 flex items-center justify-center text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors"
                 title="Sumber data"
@@ -1040,6 +1177,22 @@ export default function App() {
           )}
         </Glass>
       </div>
+
+      {/* peringatan busuk / device offline */}
+      {alerts.length > 0 && (
+        <div className="mx-auto max-w-[1360px] px-6 mt-5 flex flex-col gap-2.5">
+          {alerts.map((a) => (
+            <div
+              key={a.key}
+              className="flex items-center gap-2.5 rounded-2xl border px-5 py-3.5"
+              style={{ borderColor: "rgba(251,113,133,0.3)", background: "rgba(251,113,133,0.1)" }}
+            >
+              <AlertTriangle size={16} className="text-rose-300 shrink-0" />
+              <span className="text-[13px] text-rose-200">{a.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* status sistem */}
       <div className="mx-auto max-w-[1360px] px-6 mt-5 grid grid-cols-1 sm:grid-cols-3 gap-5">
@@ -1729,6 +1882,139 @@ export default function App() {
                   <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
                     Naikkan <code>FIRMWARE_VERSION</code> di sketch ESP32 sebelum compile file .bin
                     yang mau diupload, supaya device bisa membedakan ini firmware baru atau bukan.
+                  </p>
+                </>
+              )}
+            </div>
+          </div>
+        </Glass>
+      </div>
+
+      {/* WiFi perangkat */}
+      <div className="mx-auto max-w-[1360px] px-6 mt-5">
+        <Glass>
+          <SectionTitle
+            icon={Wifi}
+            title="WiFi perangkat"
+            sub="Ganti SSID/password ESP32 dari jarak jauh"
+            action={
+              <div className="flex gap-1 rounded-full bg-white/5 border border-white/10 p-1">
+                {Object.entries(WIFI_TARGETS).map(([key, t]) => (
+                  <button
+                    key={key}
+                    onClick={() => setWifiTarget(key)}
+                    className="px-3 py-1.5 rounded-full text-[12px] transition-colors"
+                    style={{
+                      background: wifiTarget === key ? "rgba(255,255,255,0.1)" : "transparent",
+                      color: wifiTarget === key ? "white" : "rgba(255,255,255,0.45)",
+                    }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            }
+          />
+          <div className="px-6 pb-6 pt-3 grid md:grid-cols-2 gap-6">
+            <div>
+              <div className="text-[12.5px] text-white/40 mb-1.5">
+                WiFi tercatat sekarang — {WIFI_TARGETS[wifiTarget].label}
+              </div>
+              {wifiInfo ? (
+                <div className="rounded-2xl bg-white/[0.04] border border-white/[0.06] px-4 py-3">
+                  <div className="text-[14px] font-medium text-white/85">{wifiInfo.ssid}</div>
+                  <div className="text-[12px] text-white/40 mt-0.5">
+                    Diubah {wifiInfo.updated_at ? formatHM(new Date(wifiInfo.updated_at)) : "-"}
+                  </div>
+                </div>
+              ) : (
+                <div className="text-[13px] text-white/30">
+                  {supaConfigured ? "Belum pernah diganti dari dashboard (masih pakai yang tertanam di sketch)." : "Sambungkan Supabase dulu untuk pakai fitur ini."}
+                </div>
+              )}
+              <p className="text-[11.5px] text-white/30 mt-3 leading-relaxed">
+                Password tidak ditampilkan di sini setelah tersimpan (write-only dari dashboard). Device
+                mengecek tabel ini secara berkala; kalau ada SSID baru, device otomatis coba sambung —
+                dan balik ke WiFi lama otomatis kalau yang baru gagal terhubung dalam 15 detik.
+              </p>
+
+              {wifiHistory.length > 0 && (
+                <div className="mt-4">
+                  <div className="text-[12.5px] text-white/40 mb-1.5">Riwayat percobaan terakhir</div>
+                  <div className="flex flex-col gap-1.5">
+                    {wifiHistory.map((h, i) => (
+                      <div
+                        key={h.created_at + i}
+                        className="flex items-start gap-2 rounded-xl bg-white/[0.03] border border-white/[0.06] px-3 py-2 text-[12px]"
+                      >
+                        {h.berhasil ? (
+                          <CheckCircle2 size={13} className="text-emerald-300 mt-0.5 shrink-0" />
+                        ) : (
+                          <AlertCircle size={13} className="text-rose-300 mt-0.5 shrink-0" />
+                        )}
+                        <div className="text-white/60">
+                          {h.berhasil ? (
+                            <>Berhasil tersambung ke SSID baru <b className="text-white/85">{h.ssid_dicoba}</b></>
+                          ) : (
+                            <>
+                              Gagal ke SSID <b className="text-white/85">{h.ssid_dicoba}</b>, tetap tersambung
+                              ke SSID lama <b className="text-white/85">{h.ssid_aktif}</b>
+                            </>
+                          )}
+                          <span className="text-white/30"> · {formatHM(new Date(h.created_at))}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div>
+              {!otaUnlocked ? (
+                <div className="h-full flex flex-col items-center justify-center text-center rounded-2xl bg-white/[0.04] border border-white/[0.06] px-5 py-8">
+                  <Lock size={16} className="text-white/40 mb-2" />
+                  <p className="text-[13px] text-white/50">
+                    Buka dulu panel <b>Firmware ESP32 (OTA)</b> di atas pakai PIN — panel ini pakai gerbang yang sama.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <input
+                    value={wifiSsid}
+                    onChange={(e) => setWifiSsid(e.target.value)}
+                    placeholder="Nama WiFi (SSID) baru"
+                    className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[13px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40"
+                  />
+                  <input
+                    type="password"
+                    value={wifiPassword}
+                    onChange={(e) => setWifiPassword(e.target.value)}
+                    placeholder="Password WiFi baru"
+                    className="w-full mt-2.5 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[13px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40"
+                  />
+                  <button
+                    onClick={handleWifiSave}
+                    disabled={!supaConfigured || !wifiSsid.trim() || !wifiPassword.trim() || wifiStatus === "saving"}
+                    className="mt-2.5 w-full py-2.5 rounded-xl bg-cyan-300/15 border border-cyan-300/25 text-cyan-200 text-[13px] hover:bg-cyan-300/25 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Wifi size={14} />
+                    {wifiStatus === "saving" ? "Menyimpan…" : "Kirim ke device"}
+                  </button>
+
+                  {wifiStatus === "success" && (
+                    <div className="mt-2.5 flex items-center gap-1.5 text-[12.5px] text-emerald-300">
+                      <CheckCircle2 size={13} /> Tersimpan. Device akan mencoba sambung di siklus cek berikutnya.
+                    </div>
+                  )}
+                  {wifiStatus === "error" && (
+                    <div className="mt-2.5 flex items-center gap-1.5 text-[12.5px] text-rose-300">
+                      <AlertCircle size={13} /> {wifiError}
+                    </div>
+                  )}
+                  <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
+                    Pastikan SSID dan password benar — device baru bisa dihubungi lagi lewat dashboard
+                    ini kalau berhasil konek ke WiFi yang kamu masukkan.
                   </p>
                 </>
               )}
