@@ -34,6 +34,8 @@ import {
   AlertCircle,
   Lock,
   Unlock,
+  Camera,
+  RotateCw,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -384,9 +386,10 @@ export default function App() {
   const [fanOn, setFanOn] = useState(false);
 
   const [activeTab, setActiveTab] = useState("suhu");
-  const [streamUrl, setStreamUrl] = useState("");
-  const [connectedUrl, setConnectedUrl] = useState("");
+  const [streamUrl, setStreamUrl] = useState(import.meta.env.VITE_CAMERA_URL || "");
+  const [connectedUrl, setConnectedUrl] = useState(import.meta.env.VITE_CAMERA_URL || "");
   const [streamError, setStreamError] = useState(false);
+  const [cameraOn, setCameraOn] = useState(true);
 
   const [tick, setTick] = useState(0);
   const [insights, setInsights] = useState([]);
@@ -420,6 +423,13 @@ export default function App() {
   );
 
   // ------ OTA firmware ------
+  // Dua device beda punya baris masing-masing di tabel ota_firmware, supaya
+  // firmware satu board gak nyasar coba di-flash ke board yang lain.
+  const OTA_TARGETS = {
+    sensor: { id: 1, label: "ESP32 (Sensor + Kipas)", storagePath: "firmware-sensor.bin" },
+    cam: { id: 2, label: "ESP32-CAM", storagePath: "firmware-cam.bin" },
+  };
+  const [otaTarget, setOtaTarget] = useState("sensor");
   const [otaInfo, setOtaInfo] = useState(null); // { version, url, notes, uploaded_at }
   const [otaFile, setOtaFile] = useState(null);
   const [otaVersion, setOtaVersion] = useState("");
@@ -458,10 +468,11 @@ export default function App() {
   useEffect(() => {
     if (!supabase) return;
     let cancelled = false;
+    setOtaInfo(null);
     supabase
       .from("ota_firmware")
       .select("version,url,notes,uploaded_at")
-      .eq("id", 1)
+      .eq("id", OTA_TARGETS[otaTarget].id)
       .maybeSingle()
       .then(({ data }) => {
         if (!cancelled && data) setOtaInfo(data);
@@ -469,22 +480,22 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [supabase, otaStatus]);
+  }, [supabase, otaStatus, otaTarget]);
 
   const handleOtaUpload = async () => {
     if (!supabase || !otaFile || !otaVersion.trim()) return;
     setOtaStatus("uploading");
     setOtaError("");
     try {
-      const path = `firmware-latest.bin`;
+      const target = OTA_TARGETS[otaTarget];
       const { error: uploadError } = await supabase.storage
         .from("firmware")
-        .upload(path, otaFile, { upsert: true, contentType: "application/octet-stream" });
+        .upload(target.storagePath, otaFile, { upsert: true, contentType: "application/octet-stream" });
       if (uploadError) throw uploadError;
 
-      const { data: pub } = supabase.storage.from("firmware").getPublicUrl(path);
+      const { data: pub } = supabase.storage.from("firmware").getPublicUrl(target.storagePath);
       const { error: dbError } = await supabase.from("ota_firmware").upsert({
-        id: 1,
+        id: target.id,
         version: otaVersion.trim(),
         url: `${pub.publicUrl}?t=${Date.now()}`, // cache-bust supaya ESP32 selalu ambil versi terbaru
         notes: otaNotes.trim(),
@@ -501,6 +512,63 @@ export default function App() {
       setOtaError(err.message || "Gagal upload firmware");
     }
   };
+
+  // ------ Snapshot kamera (akses dari mana saja, tanpa port forwarding/Tailscale) ------
+  const [latestSnapshot, setLatestSnapshot] = useState(null); // { url, source, captured_at }
+  const [snapshotWaiting, setSnapshotWaiting] = useState(false);
+  const [snapshotTimedOut, setSnapshotTimedOut] = useState(false);
+  const snapshotRequestedAtRef = useRef(null);
+
+  useEffect(() => {
+    if (!supabase) return;
+    let cancelled = false;
+
+    async function loadLatest() {
+      const { data } = await supabase
+        .from("camera_snapshots")
+        .select("url,source,captured_at")
+        .order("captured_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (!cancelled && data) setLatestSnapshot(data);
+    }
+    loadLatest();
+
+    const channel = supabase
+      .channel("camera-snapshots-live")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "camera_snapshots" },
+        (payload) => {
+          setLatestSnapshot(payload.new);
+          setSnapshotWaiting(false);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase.removeChannel(channel);
+    };
+  }, [supabase]);
+
+  const handleCaptureNow = async () => {
+    if (!supabase) return;
+    const requestTime = new Date().toISOString();
+    snapshotRequestedAtRef.current = requestTime;
+    setSnapshotWaiting(true);
+    setSnapshotTimedOut(false);
+    await supabase.from("camera_command").upsert({ id: 1, capture_requested_at: requestTime });
+  };
+
+  useEffect(() => {
+    if (!snapshotWaiting) return;
+    const id = setTimeout(() => {
+      setSnapshotWaiting(false);
+      setSnapshotTimedOut(true);
+    }, 60000); // 1 menit — kalau ESP32-CAM offline/gak sempat polling, jangan stuck loading terus
+    return () => clearTimeout(id);
+  }, [snapshotWaiting]);
 
   // simulasi data real-time (dipakai saat Supabase belum dikonfigurasi)
   useEffect(() => {
@@ -1031,13 +1099,31 @@ export default function App() {
         {/* camera */}
         <Glass>
           <SectionTitle
-            icon={connectedUrl && !streamError ? Video : VideoOff}
+            icon={cameraOn && connectedUrl && !streamError ? Video : VideoOff}
             title="Kamera box"
             sub="Streaming MJPEG dari ESP32-CAM"
+            action={
+              <button
+                onClick={() => setCameraOn((v) => !v)}
+                className="h-7 w-12 rounded-full relative transition-colors shrink-0"
+                style={{ background: cameraOn ? "rgba(110,231,183,0.35)" : "rgba(255,255,255,0.1)" }}
+                title={cameraOn ? "Matikan tampilan kamera" : "Nyalakan tampilan kamera"}
+              >
+                <span
+                  className="absolute top-0.5 h-6 w-6 rounded-full bg-white transition-all"
+                  style={{ left: cameraOn ? "calc(100% - 26px)" : "2px" }}
+                />
+              </button>
+            }
           />
           <div className="px-6 pb-6 pt-3">
             <div className="aspect-video rounded-2xl bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center">
-              {connectedUrl && !streamError ? (
+              {!cameraOn ? (
+                <div className="text-center text-white/30 text-[13px] px-6">
+                  <VideoOff size={26} className="mx-auto mb-2 opacity-50" />
+                  Kamera dimatikan
+                </div>
+              ) : connectedUrl && !streamError ? (
                 <img
                   src={connectedUrl}
                   alt="Stream ESP32-CAM"
@@ -1069,7 +1155,10 @@ export default function App() {
               </button>
             </div>
             <p className="text-[11.5px] text-white/30 mt-2 leading-relaxed">
-              Alamat ini adalah endpoint stream ESP32-CAM di jaringan lokal. Perangkat yang membuka dashboard harus berada di jaringan yang sama dengan box.
+              {import.meta.env.VITE_CAMERA_URL
+                ? "Alamat sudah otomatis terisi dari pengaturan proyek. Ubah di kolom atas kalau IP kamera berubah."
+                : "Alamat ini adalah endpoint stream ESP32-CAM di jaringan lokal. Perangkat yang membuka dashboard harus berada di jaringan yang sama dengan box."}
+              {" "}Tombol di pojok kanan atas cuma menyembunyikan tampilan di dashboard, bukan mematikan daya kamera fisik.
             </p>
           </div>
         </Glass>
@@ -1192,6 +1281,59 @@ export default function App() {
         </Glass>
       </div>
 
+      {/* snapshot kamera (akses dari mana saja) */}
+      <div className="mx-auto max-w-[1360px] px-6 mt-5">
+        <Glass>
+          <SectionTitle
+            icon={Camera}
+            title="Snapshot kamera"
+            sub="Foto berkala tiap 30 menit — bisa diakses dari mana saja, tanpa port forwarding"
+            action={
+              <button
+                onClick={handleCaptureNow}
+                disabled={!supaConfigured || snapshotWaiting}
+                className="h-8 px-3 rounded-full border border-cyan-300/25 bg-cyan-300/15 flex items-center gap-1.5 text-cyan-200 hover:bg-cyan-300/25 transition-colors text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <RotateCw size={13} className={snapshotWaiting ? "animate-spin" : ""} />
+                {snapshotWaiting ? "Menunggu ESP32-CAM…" : "Ambil sekarang"}
+              </button>
+            }
+          />
+          <div className="px-6 pb-6 pt-3">
+            <div className="aspect-video rounded-2xl bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center">
+              {latestSnapshot ? (
+                <img
+                  src={latestSnapshot.url}
+                  alt="Snapshot terakhir box"
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <div className="text-center text-white/35 text-[13px] px-6">
+                  <Camera size={26} className="mx-auto mb-2 opacity-60" />
+                  {supaConfigured ? "Belum ada snapshot yang masuk." : "Sambungkan Supabase dulu untuk pakai fitur ini."}
+                </div>
+              )}
+            </div>
+            <div className="mt-3 flex items-center justify-between text-[12.5px] text-white/40">
+              <span>
+                {latestSnapshot
+                  ? `Diambil ${formatRelative(Math.floor((nowTick - new Date(latestSnapshot.captured_at).getTime()) / 1000))} · ${latestSnapshot.source === "manual" ? "manual" : "otomatis"}`
+                  : "—"}
+              </span>
+              {snapshotTimedOut && (
+                <span className="text-rose-300">ESP32-CAM tidak merespons, coba lagi.</span>
+              )}
+            </div>
+            <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
+              ESP32-CAM ambil foto otomatis tiap 30 menit dan upload ke Supabase — jalan lewat internet
+              biasa, tidak butuh port forwarding, Tailscale, atau berada di jaringan yang sama. Tombol
+              "Ambil sekarang" minta ESP32-CAM memotret di luar jadwal itu; prosesnya butuh beberapa
+              detik sampai semenit tergantung kecepatan internet box.
+            </p>
+          </div>
+        </Glass>
+      </div>
+
       {/* OTA firmware */}
       <div className="mx-auto max-w-[1360px] px-6 mt-5">
         <Glass>
@@ -1199,10 +1341,29 @@ export default function App() {
             icon={UploadCloud}
             title="Firmware ESP32 (OTA)"
             sub="Upload .bin, ESP32 mengambilnya sendiri lewat Supabase"
+            action={
+              <div className="flex gap-1 rounded-full bg-white/5 border border-white/10 p-1">
+                {Object.entries(OTA_TARGETS).map(([key, t]) => (
+                  <button
+                    key={key}
+                    onClick={() => setOtaTarget(key)}
+                    className="px-3 py-1.5 rounded-full text-[12px] transition-colors"
+                    style={{
+                      background: otaTarget === key ? "rgba(255,255,255,0.1)" : "transparent",
+                      color: otaTarget === key ? "white" : "rgba(255,255,255,0.45)",
+                    }}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            }
           />
           <div className="px-6 pb-6 pt-3 grid md:grid-cols-2 gap-6">
             <div>
-              <div className="text-[12.5px] text-white/40 mb-1.5">Firmware aktif tercatat</div>
+              <div className="text-[12.5px] text-white/40 mb-1.5">
+                Firmware aktif tercatat — {OTA_TARGETS[otaTarget].label}
+              </div>
               {otaInfo ? (
                 <div className="rounded-2xl bg-white/[0.04] border border-white/[0.06] px-4 py-3">
                   <div className="text-[14px] font-medium text-white/85">v{otaInfo.version}</div>
@@ -1213,13 +1374,13 @@ export default function App() {
                 </div>
               ) : (
                 <div className="text-[13px] text-white/30">
-                  {supaConfigured ? "Belum ada firmware yang pernah diupload." : "Sambungkan Supabase dulu untuk pakai fitur ini."}
+                  {supaConfigured ? "Belum ada firmware yang pernah diupload untuk device ini." : "Sambungkan Supabase dulu untuk pakai fitur ini."}
                 </div>
               )}
               <p className="text-[11.5px] text-white/30 mt-3 leading-relaxed">
                 Ini cuma <b>catatan versi terbaru</b> di Supabase — bukan status firmware yang
-                benar-benar jalan di device. ESP32 mengecek tabel ini tiap beberapa menit; kalau
-                versinya beda dari yang tertanam di sketch, ESP32 download &amp; flash sendiri.
+                benar-benar jalan di device. Tiap device mengecek baris masing-masing (bukan saling
+                ketuker), lalu download &amp; flash sendiri kalau versinya beda dari sketch yang jalan.
               </p>
             </div>
 
