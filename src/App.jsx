@@ -828,27 +828,31 @@ export default function App() {
   const setThreshold = (patch) => setThresholds((t) => ({ ...t, ...patch }));
 
   // ------ Deteksi kebusukan buah (VOC = indikator utama, suhu & kelembapan = faktor pemicu) ------
+  // Pakai rentang aman (min-max) per parameter — di luar rentang = jadi faktor risiko.
   const [busukThresholds, setBusukThresholds] = useState({
-    vocBusuk: 500,
-    suhuWaspada: 30,
-    lembapWaspada: 85,
+    vocMin: 0,
+    vocMax: 500,
+    suhuMin: 15,
+    suhuMax: 30,
+    lembapMin: 50,
+    lembapMax: 85,
   });
 
   const BUSUK_COLOR = { ideal: "#6ee7b7", waspada: "#facc15", tinggi: "#fb7185" };
 
   const busukStatus = useMemo(() => {
     const { voc, suhu, lembap } = current;
-    const { vocBusuk, suhuWaspada, lembapWaspada } = busukThresholds;
+    const { vocMax, suhuMin, suhuMax, lembapMin, lembapMax } = busukThresholds;
 
-    if (voc >= vocBusuk) {
-      return { level: "tinggi", label: "Busuk", reason: `VOC ${Math.round(voc)} ppm sudah melewati ambang busuk (${vocBusuk} ppm).` };
+    if (voc > vocMax) {
+      return { level: "tinggi", label: "Busuk", reason: `VOC ${Math.round(voc)} ppm sudah melewati ambang busuk (${vocMax} ppm).` };
     }
-    const suhuTinggi = suhu > suhuWaspada;
-    const lembapTinggi = lembap > lembapWaspada;
-    if (suhuTinggi || lembapTinggi) {
+    const suhuDiluar = suhu < suhuMin || suhu > suhuMax;
+    const lembapDiluar = lembap < lembapMin || lembap > lembapMax;
+    if (suhuDiluar || lembapDiluar) {
       const sebab = [
-        suhuTinggi ? `suhu ${suhu.toFixed(1)}°C > ${suhuWaspada}°C` : null,
-        lembapTinggi ? `kelembapan ${lembap.toFixed(0)}% > ${lembapWaspada}%` : null,
+        suhuDiluar ? `suhu ${suhu.toFixed(1)}°C di luar rentang ${suhuMin}–${suhuMax}°C` : null,
+        lembapDiluar ? `kelembapan ${lembap.toFixed(0)}% di luar rentang ${lembapMin}–${lembapMax}%` : null,
       ].filter(Boolean).join(" dan ");
       return { level: "waspada", label: "Mulai Busuk", reason: `Kondisi mempercepat pembusukan: ${sebab}.` };
     }
@@ -1274,70 +1278,73 @@ export default function App() {
 
             <div className="mt-5 flex flex-col gap-5">
               <div>
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center justify-between mb-2.5">
                   <span className="text-[13px] text-white/70 flex items-center gap-2">
                     <Wind size={13} style={{ color: "#b79cff" }} />
-                    Ambang VOC busuk
+                    Rentang VOC aman
                   </span>
-                  <span className="text-[12.5px] text-white/45 tabular">{busukThresholds.vocBusuk} ppm</span>
+                  <span className="text-[12.5px] text-white/45 tabular">
+                    {busukThresholds.vocMin} – {busukThresholds.vocMax} ppm
+                  </span>
                 </div>
-                <input
-                  type="range"
-                  min={100}
-                  max={1000}
+                <DualRange
+                  boundsMin={0}
+                  boundsMax={1000}
+                  min={busukThresholds.vocMin}
+                  max={busukThresholds.vocMax}
+                  color="#b79cff"
                   step={10}
-                  value={busukThresholds.vocBusuk}
-                  onChange={(e) => setBusukThresholds((t) => ({ ...t, vocBusuk: Number(e.target.value) }))}
-                  className="single-thumb w-full"
-                  style={{ "--thumb-color": "#b79cff" }}
+                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, vocMin: newMin, vocMax: newMax }))}
                 />
               </div>
 
               <div>
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center justify-between mb-2.5">
                   <span className="text-[13px] text-white/70 flex items-center gap-2">
                     <Thermometer size={13} style={{ color: "#ff9466" }} />
-                    Ambang suhu mempercepat busuk
+                    Rentang suhu aman
                   </span>
-                  <span className="text-[12.5px] text-white/45 tabular">{busukThresholds.suhuWaspada} °C</span>
+                  <span className="text-[12.5px] text-white/45 tabular">
+                    {busukThresholds.suhuMin} – {busukThresholds.suhuMax} °C
+                  </span>
                 </div>
-                <input
-                  type="range"
-                  min={20}
-                  max={45}
+                <DualRange
+                  boundsMin={10}
+                  boundsMax={45}
+                  min={busukThresholds.suhuMin}
+                  max={busukThresholds.suhuMax}
+                  color="#ff9466"
                   step={1}
-                  value={busukThresholds.suhuWaspada}
-                  onChange={(e) => setBusukThresholds((t) => ({ ...t, suhuWaspada: Number(e.target.value) }))}
-                  className="single-thumb w-full"
-                  style={{ "--thumb-color": "#ff9466" }}
+                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, suhuMin: newMin, suhuMax: newMax }))}
                 />
               </div>
 
               <div>
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center justify-between mb-2.5">
                   <span className="text-[13px] text-white/70 flex items-center gap-2">
                     <Droplets size={13} style={{ color: "#5ec8d8" }} />
-                    Ambang kelembapan mempercepat busuk
+                    Rentang kelembapan aman
                   </span>
-                  <span className="text-[12.5px] text-white/45 tabular">{busukThresholds.lembapWaspada} %</span>
+                  <span className="text-[12.5px] text-white/45 tabular">
+                    {busukThresholds.lembapMin} – {busukThresholds.lembapMax} %
+                  </span>
                 </div>
-                <input
-                  type="range"
-                  min={50}
-                  max={95}
+                <DualRange
+                  boundsMin={20}
+                  boundsMax={95}
+                  min={busukThresholds.lembapMin}
+                  max={busukThresholds.lembapMax}
+                  color="#5ec8d8"
                   step={1}
-                  value={busukThresholds.lembapWaspada}
-                  onChange={(e) => setBusukThresholds((t) => ({ ...t, lembapWaspada: Number(e.target.value) }))}
-                  className="single-thumb w-full"
-                  style={{ "--thumb-color": "#5ec8d8" }}
+                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, lembapMin: newMin, lembapMax: newMax }))}
                 />
               </div>
             </div>
 
             <p className="text-[11.5px] text-white/30 mt-4 leading-relaxed">
-              VOC adalah indikator utama gas hasil pembusukan. Suhu dan kelembapan tinggi jadi faktor
-              yang mempercepat proses itu — status "Mulai Busuk" muncul kalau salah satu ambang ini
-              terlewati, dan "Busuk" kalau VOC sudah melewati ambang busuknya sendiri.
+              VOC adalah indikator utama gas hasil pembusukan. Suhu dan kelembapan di luar rentang aman
+              jadi faktor yang mempercepat proses itu — status "Mulai Busuk" muncul kalau suhu atau
+              kelembapan keluar dari rentangnya, dan "Busuk" kalau VOC melewati batas atas rentangnya.
             </p>
           </div>
         </Glass>
