@@ -15,13 +15,9 @@ import {
   Droplets,
   Wind,
   Fan,
-  Video,
-  VideoOff,
   Sparkles,
   RefreshCw,
   Settings2,
-  Wifi,
-  WifiOff,
   ChevronRight,
   Database,
   Clock,
@@ -36,6 +32,7 @@ import {
   Unlock,
   Camera,
   RotateCw,
+  ShieldAlert,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -386,10 +383,6 @@ export default function App() {
   const [fanOn, setFanOn] = useState(false);
 
   const [activeTab, setActiveTab] = useState("suhu");
-  const [streamUrl, setStreamUrl] = useState(import.meta.env.VITE_CAMERA_URL || "");
-  const [connectedUrl, setConnectedUrl] = useState(import.meta.env.VITE_CAMERA_URL || "");
-  const [streamError, setStreamError] = useState(false);
-  const [cameraOn, setCameraOn] = useState(true);
 
   const [tick, setTick] = useState(0);
   const [insights, setInsights] = useState([]);
@@ -833,6 +826,34 @@ export default function App() {
 
   const setThreshold = (patch) => setThresholds((t) => ({ ...t, ...patch }));
 
+  // ------ Deteksi kebusukan buah (VOC = indikator utama, suhu & kelembapan = faktor pemicu) ------
+  const [busukThresholds, setBusukThresholds] = useState({
+    vocBusuk: 500,
+    suhuWaspada: 30,
+    lembapWaspada: 85,
+  });
+
+  const BUSUK_COLOR = { ideal: "#6ee7b7", waspada: "#facc15", tinggi: "#fb7185" };
+
+  const busukStatus = useMemo(() => {
+    const { voc, suhu, lembap } = current;
+    const { vocBusuk, suhuWaspada, lembapWaspada } = busukThresholds;
+
+    if (voc >= vocBusuk) {
+      return { level: "tinggi", label: "Busuk", reason: `VOC ${Math.round(voc)} ppm sudah melewati ambang busuk (${vocBusuk} ppm).` };
+    }
+    const suhuTinggi = suhu > suhuWaspada;
+    const lembapTinggi = lembap > lembapWaspada;
+    if (suhuTinggi || lembapTinggi) {
+      const sebab = [
+        suhuTinggi ? `suhu ${suhu.toFixed(1)}°C > ${suhuWaspada}°C` : null,
+        lembapTinggi ? `kelembapan ${lembap.toFixed(0)}% > ${lembapWaspada}%` : null,
+      ].filter(Boolean).join(" dan ");
+      return { level: "waspada", label: "Mulai Busuk", reason: `Kondisi mempercepat pembusukan: ${sebab}.` };
+    }
+    return { level: "ideal", label: "Segar", reason: "VOC, suhu, dan kelembapan masih dalam kondisi aman." };
+  }, [current, busukThresholds]);
+
   const activeMetric = METRICS[activeTab];
   const activeMin = thresholds[`${activeTab}Min`];
   const activeMax = thresholds[`${activeTab}Max`];
@@ -859,11 +880,6 @@ export default function App() {
     const max = Math.min(activeMetric.bounds[1], Math.ceil(rawMax + pad));
     return min < max ? [min, max] : activeMetric.bounds;
   }, [chartData, activeMin, activeMax, activeMetric]);
-
-  const handleConnectStream = () => {
-    setStreamError(false);
-    setConnectedUrl(streamUrl.trim());
-  };
 
   return (
     <div
@@ -909,6 +925,35 @@ export default function App() {
         }
         input.dual-thumb::-webkit-slider-runnable-track { background: transparent; }
         input.dual-thumb::-moz-range-track { background: transparent; }
+
+        input.single-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          height: 6px;
+          border-radius: 999px;
+          background: rgba(255,255,255,0.1);
+        }
+        input.single-thumb::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          background: var(--thumb-color, #fff);
+          border: 2px solid rgba(8,12,20,0.9);
+          box-shadow: 0 0 8px var(--thumb-color, #fff);
+          cursor: pointer;
+          margin-top: -5px;
+        }
+        input.single-thumb::-moz-range-thumb {
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          background: var(--thumb-color, #fff);
+          border: 2px solid rgba(8,12,20,0.9);
+          box-shadow: 0 0 8px var(--thumb-color, #fff);
+          cursor: pointer;
+        }
+        input.single-thumb::-moz-range-track { background: transparent; }
 
         .tabular { font-variant-numeric: tabular-nums; }
       `}</style>
@@ -1200,71 +1245,98 @@ export default function App() {
         </Glass>
       </div>
 
-      {/* camera + fan + threshold */}
+      {/* deteksi kebusukan buah + fan + threshold */}
       <div className="mx-auto max-w-[1360px] px-6 mt-5 grid grid-cols-1 xl:grid-cols-3 gap-5">
-        {/* camera */}
+        {/* deteksi kebusukan buah */}
         <Glass>
           <SectionTitle
-            icon={cameraOn && connectedUrl && !streamError ? Video : VideoOff}
-            title="Kamera box"
-            sub="Streaming MJPEG dari ESP32-CAM"
-            action={
-              <button
-                onClick={() => setCameraOn((v) => !v)}
-                className="h-7 w-12 rounded-full relative transition-colors shrink-0"
-                style={{ background: cameraOn ? "rgba(110,231,183,0.35)" : "rgba(255,255,255,0.1)" }}
-                title={cameraOn ? "Matikan tampilan kamera" : "Nyalakan tampilan kamera"}
-              >
-                <span
-                  className="absolute top-0.5 h-6 w-6 rounded-full bg-white transition-all"
-                  style={{ left: cameraOn ? "calc(100% - 26px)" : "2px" }}
-                />
-              </button>
-            }
+            icon={ShieldAlert}
+            title="Deteksi kebusukan buah"
+            sub="Gabungan VOC, suhu & kelembapan"
           />
           <div className="px-6 pb-6 pt-3">
-            <div className="aspect-video rounded-2xl bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center">
-              {!cameraOn ? (
-                <div className="text-center text-white/30 text-[13px] px-6">
-                  <VideoOff size={26} className="mx-auto mb-2 opacity-50" />
-                  Kamera dimatikan
-                </div>
-              ) : connectedUrl && !streamError ? (
-                <img
-                  src={connectedUrl}
-                  alt="Stream ESP32-CAM"
-                  className="w-full h-full object-cover"
-                  onError={() => setStreamError(true)}
-                />
-              ) : (
-                <div className="text-center text-white/35 text-[13px] px-6">
-                  <VideoOff size={26} className="mx-auto mb-2 opacity-60" />
-                  {streamError
-                    ? "Tidak bisa memuat stream. Periksa alamat dan pastikan berada di jaringan yang sama."
-                    : "Belum tersambung ke kamera"}
-                </div>
-              )}
-            </div>
-            <div className="mt-3 flex flex-col sm:flex-row gap-2">
-              <input
-                value={streamUrl}
-                onChange={(e) => setStreamUrl(e.target.value)}
-                placeholder="http://192.168.1.20:81/stream"
-                className="flex-1 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-[13px] text-white/85 placeholder-white/25 outline-none focus:border-cyan-300/40"
-              />
-              <button
-                onClick={handleConnectStream}
-                className="px-4 py-2 sm:py-0 rounded-xl bg-cyan-300/15 border border-cyan-300/25 text-cyan-200 text-[13px] hover:bg-cyan-300/25 transition-colors flex items-center justify-center gap-1.5 shrink-0"
+            <div
+              className="rounded-2xl border px-5 py-6 text-center"
+              style={{
+                borderColor: `${BUSUK_COLOR[busukStatus.level]}40`,
+                background: `${BUSUK_COLOR[busukStatus.level]}12`,
+              }}
+            >
+              <div
+                className="text-[22px] font-semibold"
+                style={{ color: BUSUK_COLOR[busukStatus.level], fontFamily: "'Space Grotesk', sans-serif" }}
               >
-                {connectedUrl && !streamError ? <Wifi size={14} /> : <WifiOff size={14} />}
-                Hubungkan
-              </button>
+                {busukStatus.label}
+              </div>
+              <p className="text-[12.5px] text-white/50 mt-1.5">{busukStatus.reason}</p>
             </div>
-            <p className="text-[11.5px] text-white/30 mt-2 leading-relaxed">
-              {import.meta.env.VITE_CAMERA_URL
-                ? "Alamat sudah otomatis terisi dari pengaturan proyek. Ubah di kolom atas kalau IP kamera berubah."
-                : "Alamat ini adalah endpoint stream ESP32-CAM di jaringan lokal. Perangkat yang membuka dashboard harus berada di jaringan yang sama dengan box."}
-              {" "}Tombol di pojok kanan atas cuma menyembunyikan tampilan di dashboard, bukan mematikan daya kamera fisik.
+
+            <div className="mt-5 flex flex-col gap-5">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[13px] text-white/70 flex items-center gap-2">
+                    <Wind size={13} style={{ color: "#b79cff" }} />
+                    Ambang VOC busuk
+                  </span>
+                  <span className="text-[12.5px] text-white/45 tabular">{busukThresholds.vocBusuk} ppm</span>
+                </div>
+                <input
+                  type="range"
+                  min={100}
+                  max={1000}
+                  step={10}
+                  value={busukThresholds.vocBusuk}
+                  onChange={(e) => setBusukThresholds((t) => ({ ...t, vocBusuk: Number(e.target.value) }))}
+                  className="single-thumb w-full"
+                  style={{ "--thumb-color": "#b79cff" }}
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[13px] text-white/70 flex items-center gap-2">
+                    <Thermometer size={13} style={{ color: "#ff9466" }} />
+                    Ambang suhu mempercepat busuk
+                  </span>
+                  <span className="text-[12.5px] text-white/45 tabular">{busukThresholds.suhuWaspada} °C</span>
+                </div>
+                <input
+                  type="range"
+                  min={20}
+                  max={45}
+                  step={1}
+                  value={busukThresholds.suhuWaspada}
+                  onChange={(e) => setBusukThresholds((t) => ({ ...t, suhuWaspada: Number(e.target.value) }))}
+                  className="single-thumb w-full"
+                  style={{ "--thumb-color": "#ff9466" }}
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[13px] text-white/70 flex items-center gap-2">
+                    <Droplets size={13} style={{ color: "#5ec8d8" }} />
+                    Ambang kelembapan mempercepat busuk
+                  </span>
+                  <span className="text-[12.5px] text-white/45 tabular">{busukThresholds.lembapWaspada} %</span>
+                </div>
+                <input
+                  type="range"
+                  min={50}
+                  max={95}
+                  step={1}
+                  value={busukThresholds.lembapWaspada}
+                  onChange={(e) => setBusukThresholds((t) => ({ ...t, lembapWaspada: Number(e.target.value) }))}
+                  className="single-thumb w-full"
+                  style={{ "--thumb-color": "#5ec8d8" }}
+                />
+              </div>
+            </div>
+
+            <p className="text-[11.5px] text-white/30 mt-4 leading-relaxed">
+              VOC adalah indikator utama gas hasil pembusukan. Suhu dan kelembapan tinggi jadi faktor
+              yang mempercepat proses itu — status "Mulai Busuk" muncul kalau salah satu ambang ini
+              terlewati, dan "Busuk" kalau VOC sudah melewati ambang busuknya sendiri.
             </p>
           </div>
         </Glass>
