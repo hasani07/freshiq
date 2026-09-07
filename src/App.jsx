@@ -651,24 +651,35 @@ export default function App() {
   const [camRssi, setCamRssi] = useState(null);
   const CAM_ONLINE_THRESHOLD_SEC = 30; // heartbeat tiap 10 detik, kasih margin 3x lipat
 
-  useEffect(() => {
+  const fetchCameraStatus = useCallback(async () => {
     if (!supabase) return;
 
-    supabase
+    const { data, error } = await supabase
       .from("camera_status")
       .select("last_seen,rssi")
       .eq("id", 1)
-      .maybeSingle()
-      .then(({ data }) => {
-        if (data?.last_seen) setCamLastSeen(new Date(data.last_seen));
-        if (data?.rssi != null) setCamRssi(data.rssi);
-      });
+      .maybeSingle();
+
+    if (error) {
+      console.error("Gagal membaca status ESP32-CAM:", error);
+      return;
+    }
+
+    if (data?.last_seen) setCamLastSeen(new Date(data.last_seen));
+    if (data?.rssi != null) setCamRssi(data.rssi);
+  }, [supabase]);
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    fetchCameraStatus();
+    const id = setInterval(fetchCameraStatus, 10000);
 
     const channel = supabase
       .channel("camera-status-live")
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "camera_status" },
+        { event: "UPDATE", schema: "public", table: "camera_status", filter: "id=eq.1" },
         (payload) => {
           if (payload.new?.last_seen) setCamLastSeen(new Date(payload.new.last_seen));
           if (payload.new?.rssi != null) setCamRssi(payload.new.rssi);
@@ -677,22 +688,27 @@ export default function App() {
       .subscribe();
 
     return () => {
+      clearInterval(id);
       supabase.removeChannel(channel);
     };
-  }, [supabase]);
+  }, [supabase, fetchCameraStatus]);
 
   const camOnline =
     supaConfigured && camLastSeen ? (nowTick - camLastSeen.getTime()) / 1000 < CAM_ONLINE_THRESHOLD_SEC : false;
 
-  // ------ Snapshot kamera (akses dari mana saja, tanpa port forwarding/Tailscale) ------
+  // ------ Snapshot kamera (tanpa live stream) ------
   const [latestSnapshot, setLatestSnapshot] = useState(null); // { url, source, captured_at }
   const [snapshotHistory, setSnapshotHistory] = useState([]); // hasil filter saat ini, terbaru dulu
   const [snapshotWaiting, setSnapshotWaiting] = useState(false);
   const [snapshotTimedOut, setSnapshotTimedOut] = useState(false);
   const [snapshotViewing, setSnapshotViewing] = useState(null); // snapshot yang lagi dilihat gede
+  const [snapshotCommandError, setSnapshotCommandError] = useState("");
   const snapshotRequestedAtRef = useRef(null);
+  const snapshotBaselineCapturedAtRef = useRef(null);
 
-  const SNAPSHOT_HISTORY_LIMIT = 16; // dipakai kalau filter = "latest" (tanpa rentang tanggal)
+  const SNAPSHOT_HISTORY_LIMIT = 16;
+  const SNAPSHOT_TIMEOUT_MS = 45000;
+  const SNAPSHOT_POLL_MS = 1500;
 
   // filter riwayat: "latest" (16 terakhir) | "1"/"3"/"7" (n hari terakhir) | "date" (tanggal tertentu)
   const [snapshotFilterMode, setSnapshotFilterMode] = useState("latest");
@@ -733,7 +749,11 @@ export default function App() {
       query = query.limit(SNAPSHOT_HISTORY_LIMIT);
     }
 
-    const { data } = await query;
+    const { data, error } = await query;
+    if (error) {
+      console.error("Gagal membaca riwayat snapshot:", error);
+      return;
+    }
     setSnapshotHistory(data || []);
   }, [supabase, snapshotFilterMode, snapshotFilterDate]);
 
@@ -741,17 +761,55 @@ export default function App() {
     fetchSnapshotHistory();
   }, [fetchSnapshotHistory]);
 
+  const isSnapshotForCurrentRequest = useCallback((snapshot) => {
+    if (!snapshot || snapshot.source !== "manual") return false;
+
+    const capturedAt = new Date(snapshot.captured_at).getTime();
+    if (!Number.isFinite(capturedAt)) return false;
+
+    const requestedAt = snapshotRequestedAtRef.current;
+    if (requestedAt) {
+      const requestedMs = new Date(requestedAt).getTime();
+      if (Number.isFinite(requestedMs) && capturedAt < requestedMs - 10000) return false;
+    }
+
+    // Baseline dibuat tepat sebelum command dikirim, jadi snapshot manual lama tidak dihitung.
+    const baseline = snapshotBaselineCapturedAtRef.current;
+    if (baseline) {
+      const baselineMs = new Date(baseline).getTime();
+      if (Number.isFinite(baselineMs) && capturedAt <= baselineMs) return false;
+    }
+
+    return true;
+  }, []);
+
+  const applyNewSnapshot = useCallback(
+    (snapshot) => {
+      if (!snapshot?.url || !snapshot?.captured_at) return;
+
+      setLatestSnapshot(snapshot);
+      if (snapshotInCurrentFilter(snapshot)) {
+        const cap = snapshotFilterMode === "latest" ? SNAPSHOT_HISTORY_LIMIT : 300;
+        setSnapshotHistory((h) => [snapshot, ...h].slice(0, cap));
+      }
+    },
+    [snapshotInCurrentFilter, snapshotFilterMode]
+  );
+
   useEffect(() => {
     if (!supabase) return;
 
-    // ambil foto TERBARU secara umum (independen dari filter), untuk tampilan utama
     supabase
       .from("camera_snapshots")
       .select("url,source,captured_at")
       .order("captured_at", { ascending: false })
       .limit(1)
       .maybeSingle()
-      .then(({ data }) => {
+      .then(({ data, error }) => {
+        if (error) {
+          console.error("Gagal membaca snapshot terbaru:", error);
+          return;
+        }
         if (data) setLatestSnapshot(data);
       });
 
@@ -762,137 +820,114 @@ export default function App() {
         { event: "INSERT", schema: "public", table: "camera_snapshots" },
         (payload) => {
           const snapshot = payload.new;
-          if (!snapshot?.url || !snapshot?.captured_at) return;
+          applyNewSnapshot(snapshot);
 
-          setLatestSnapshot(snapshot);
-
-          if (snapshotInCurrentFilter(snapshot)) {
-            const cap = snapshotFilterMode === "latest" ? SNAPSHOT_HISTORY_LIMIT : 300;
-            setSnapshotHistory((h) => {
-              const withoutDuplicate = h.filter((item) => item.captured_at !== snapshot.captured_at);
-              return [snapshot, ...withoutDuplicate].slice(0, cap);
-            });
-          }
-
-          // Hanya anggap selesai kalau foto ini memang dibuat SETELAH
-          // tombol "Ambil sekarang" ditekan. Snapshot interval lama tidak
-          // boleh mematikan indikator "menunggu".
-          const requestedAt = snapshotRequestedAtRef.current;
-          if (requestedAt) {
-            const isNewCapture =
-              new Date(snapshot.captured_at).getTime() >= new Date(requestedAt).getTime();
-
-            if (isNewCapture) {
-              setSnapshotWaiting(false);
-              setSnapshotTimedOut(false);
-            }
+          // Realtime adalah jalur cepat. Polling di bawah tetap menjadi fallback kalau Realtime gagal.
+          if (snapshotWaiting && isSnapshotForCurrentRequest(snapshot)) {
+            setSnapshotWaiting(false);
+            setSnapshotTimedOut(false);
+            setSnapshotCommandError("");
+            snapshotRequestedAtRef.current = null;
+            snapshotBaselineCapturedAtRef.current = null;
           }
         }
       )
-      .subscribe((status) => {
-        console.log("Status realtime camera_snapshots:", status);
-      });
+      .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [supabase, snapshotInCurrentFilter, snapshotFilterMode]);
-
-  const [snapshotCommandError, setSnapshotCommandError] = useState("");
+  }, [supabase, applyNewSnapshot, snapshotWaiting, isSnapshotForCurrentRequest]);
 
   const handleCaptureNow = async () => {
-    if (!supabase) return;
-
-    const requestTime = new Date().toISOString();
-    snapshotRequestedAtRef.current = requestTime;
+    if (!supabase || snapshotWaiting) return;
 
     setSnapshotWaiting(true);
     setSnapshotTimedOut(false);
     setSnapshotCommandError("");
 
-    const { error } = await supabase
-      .from("camera_command")
-      .upsert({
-        id: 1,
-        capture_requested_at: requestTime,
-      });
-
-    if (error) {
-      console.error("Gagal kirim perintah capture:", error);
-      setSnapshotWaiting(false);
-      setSnapshotCommandError(
-        error.message || "Gagal mengirim perintah ke Supabase"
-      );
-      return;
-    }
-
-    console.log("Perintah capture terkirim:", requestTime);
-
-    // Realtime tetap dipakai, tetapi polling ini menjadi BACKUP.
-    // Jadi dashboard tetap akan mendapatkan foto walaupun event Realtime
-    // terlambat/tidak masuk ke browser.
-    let attempts = 0;
-    const maxAttempts = 30; // 30 x 2 detik = 60 detik
-
-    const pollId = setInterval(async () => {
-      attempts++;
-
-      const { data, error: queryError } = await supabase
+    try {
+      // Ambil snapshot terakhir sebelum command sebagai baseline.
+      // Ini membuat polling tidak salah menganggap foto manual lama sebagai hasil klik sekarang.
+      const { data: baseline, error: baselineError } = await supabase
         .from("camera_snapshots")
-        .select("url,source,captured_at")
+        .select("captured_at")
         .order("captured_at", { ascending: false })
         .limit(1)
         .maybeSingle();
 
-      if (queryError) {
-        console.error("Gagal cek snapshot terbaru:", queryError);
-      }
+      if (baselineError) throw baselineError;
+      snapshotBaselineCapturedAtRef.current = baseline?.captured_at || null;
 
-      if (data?.captured_at) {
-        const requestMs = new Date(requestTime).getTime();
-        const snapshotMs = new Date(data.captured_at).getTime();
+      const requestTime = new Date().toISOString();
+      snapshotRequestedAtRef.current = requestTime;
 
-        if (snapshotMs >= requestMs) {
-          console.log("Snapshot baru ditemukan lewat polling:", data);
+      const { error } = await supabase
+        .from("camera_command")
+        .upsert({ id: 1, capture_requested_at: requestTime });
 
-          setLatestSnapshot(data);
-
-          setSnapshotHistory((prev) => {
-            const withoutDuplicate = prev.filter(
-              (item) => item.captured_at !== data.captured_at
-            );
-            return [data, ...withoutDuplicate].slice(
-              0,
-              SNAPSHOT_HISTORY_LIMIT
-            );
-          });
-
-          setSnapshotWaiting(false);
-          setSnapshotTimedOut(false);
-          clearInterval(pollId);
-          snapshotRequestedAtRef.current = null;
-          return;
-        }
-      }
-
-      if (attempts >= maxAttempts) {
-        clearInterval(pollId);
-        setSnapshotWaiting(false);
-        setSnapshotTimedOut(true);
-        console.warn("Timeout menunggu snapshot baru dari ESP32-CAM");
-        snapshotRequestedAtRef.current = null;
-      }
-    }, 2000);
+      if (error) throw error;
+    } catch (err) {
+      console.error("Gagal mengirim perintah capture:", err);
+      setSnapshotWaiting(false);
+      setSnapshotCommandError(err?.message || "Gagal mengirim perintah ke Supabase");
+      snapshotRequestedAtRef.current = null;
+      snapshotBaselineCapturedAtRef.current = null;
+    }
   };
 
+  // Polling adalah fallback utama jika Supabase Realtime tidak mengirim event INSERT ke browser.
   useEffect(() => {
-    if (!snapshotWaiting) return;
-    const id = setTimeout(() => {
-      setSnapshotWaiting(false);
-      setSnapshotTimedOut(true);
-    }, 60000); // 1 menit — kalau ESP32-CAM offline/gak sempat polling, jangan stuck loading terus
-    return () => clearTimeout(id);
-  }, [snapshotWaiting]);
+    if (!snapshotWaiting || !supabase) return;
+
+    let cancelled = false;
+    let timer = null;
+    const startedAt = Date.now();
+
+    const poll = async () => {
+      if (cancelled) return;
+
+      const { data, error } = await supabase
+        .from("camera_snapshots")
+        .select("url,source,captured_at")
+        .eq("source", "manual")
+        .order("captured_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (cancelled) return;
+
+      if (!error && data && isSnapshotForCurrentRequest(data)) {
+        applyNewSnapshot(data);
+        setSnapshotWaiting(false);
+        setSnapshotTimedOut(false);
+        setSnapshotCommandError("");
+        snapshotRequestedAtRef.current = null;
+        snapshotBaselineCapturedAtRef.current = null;
+        return;
+      }
+
+      if (Date.now() - startedAt >= SNAPSHOT_TIMEOUT_MS) {
+        setSnapshotWaiting(false);
+        setSnapshotTimedOut(true);
+        if (error) {
+          setSnapshotCommandError("Tidak bisa memverifikasi hasil capture dari Supabase.");
+        }
+        snapshotRequestedAtRef.current = null;
+        snapshotBaselineCapturedAtRef.current = null;
+        return;
+      }
+
+      timer = setTimeout(poll, SNAPSHOT_POLL_MS);
+    };
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [snapshotWaiting, supabase, isSnapshotForCurrentRequest, applyNewSnapshot]);
 
   // simulasi data real-time (dipakai saat Supabase belum dikonfigurasi)
   useEffect(() => {
@@ -1872,7 +1907,7 @@ export default function App() {
           <SectionTitle
             icon={Camera}
             title="Snapshot kamera"
-            sub="Foto berkala tiap 30 menit — bisa diakses dari mana saja, tanpa port forwarding"
+            sub="Foto berkala tiap 30 menit — live stream dinonaktifkan agar capture lebih stabil"
             action={
               <div className="flex items-center gap-2">
                 <div
@@ -1890,7 +1925,7 @@ export default function App() {
                 </div>
                 <button
                   onClick={handleCaptureNow}
-                  disabled={!supaConfigured || snapshotWaiting}
+                  disabled={!supaConfigured || !camOnline || snapshotWaiting}
                   className="h-8 px-3 rounded-full border border-cyan-300/25 bg-cyan-300/15 flex items-center gap-1.5 text-cyan-200 hover:bg-cyan-300/25 transition-colors text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <RotateCw size={13} className={snapshotWaiting ? "animate-spin" : ""} />
