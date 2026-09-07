@@ -842,6 +842,24 @@ export default function App() {
     [history, activeTab]
   );
 
+  // Sumbu Y grafik dibuat menyesuaikan data yang benar-benar tampil (bukan dipatok ke
+  // batas maksimal sensor), supaya naik-turun kecil tetap kelihatan jelas. Tetap
+  // menyertakan rentang ideal (activeMin/activeMax) biar pita hijaunya selalu utuh
+  // terlihat, dan dikunci di dalam batas fisik sensor (activeMetric.bounds).
+  const yDomain = useMemo(() => {
+    const values = chartData.map((d) => d.value).filter((v) => typeof v === "number" && !isNaN(v));
+    if (values.length === 0) return activeMetric.bounds;
+
+    const rawMin = Math.min(...values, activeMin);
+    const rawMax = Math.max(...values, activeMax);
+    const span = rawMax - rawMin;
+    const pad = span > 0 ? span * 0.2 : Math.max(rawMax * 0.1, 5);
+
+    const min = Math.max(activeMetric.bounds[0], Math.floor(rawMin - pad));
+    const max = Math.min(activeMetric.bounds[1], Math.ceil(rawMax + pad));
+    return min < max ? [min, max] : activeMetric.bounds;
+  }, [chartData, activeMin, activeMax, activeMetric]);
+
   const handleConnectStream = () => {
     setStreamError(false);
     setConnectedUrl(streamUrl.trim());
@@ -1109,7 +1127,7 @@ export default function App() {
           />
           <div className="px-4 pb-5 pt-3 h-[300px]">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 8, right: 18, left: -12, bottom: 0 }}>
+              <AreaChart data={chartData} margin={{ top: 8, right: 18, left: 4, bottom: 0 }}>
                 <defs>
                   <linearGradient id="fillMetric" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor={activeMetric.color} stopOpacity={0.45} />
@@ -1129,11 +1147,12 @@ export default function App() {
                   minTickGap={40}
                 />
                 <YAxis
-                  domain={activeMetric.bounds}
+                  domain={yDomain}
                   tick={{ fill: "rgba(255,255,255,0.35)", fontSize: 11 }}
                   axisLine={false}
                   tickLine={false}
-                  width={36}
+                  width={44}
+                  allowDecimals={false}
                 />
                 <ReferenceArea y1={activeMin} y2={activeMax} fill="#6ee7b7" fillOpacity={0.07} stroke="none" />
                 <Tooltip
