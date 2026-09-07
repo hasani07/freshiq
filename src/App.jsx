@@ -567,6 +567,8 @@ export default function App() {
   // riwayat percobaan ganti WiFi (berhasil/gagal-rollback), per device yang dipilih di tab
   const [wifiHistory, setWifiHistory] = useState([]);
 
+  const WIFI_HISTORY_LIMIT = 3;
+
   useEffect(() => {
     if (!supabase) return;
 
@@ -575,7 +577,7 @@ export default function App() {
       .select("ssid_dicoba,berhasil,ssid_aktif,created_at")
       .eq("device_id", WIFI_TARGETS[wifiTarget].id)
       .order("created_at", { ascending: false })
-      .limit(5)
+      .limit(WIFI_HISTORY_LIMIT)
       .then(({ data }) => setWifiHistory(data || []));
 
     const channel = supabase
@@ -585,7 +587,7 @@ export default function App() {
         { event: "INSERT", schema: "public", table: "wifi_history" },
         (payload) => {
           if (payload.new.device_id === WIFI_TARGETS[wifiTarget].id) {
-            setWifiHistory((h) => [payload.new, ...h].slice(0, 5));
+            setWifiHistory((h) => [payload.new, ...h].slice(0, WIFI_HISTORY_LIMIT));
           }
         }
       )
