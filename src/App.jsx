@@ -38,6 +38,10 @@ import {
   Bell,
   BellOff,
   AlertTriangle,
+  SignalHigh,
+  SignalMedium,
+  SignalLow,
+  SignalZero,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -131,6 +135,16 @@ function formatBytes(rows) {
   const mb = (rows * BYTES_PER_ROW_ESTIMATE) / (1024 * 1024);
   if (mb < 0.01) return "< 0.01 MB";
   return `${mb.toFixed(mb < 10 ? 2 : 1)} MB`;
+}
+
+// kekuatan sinyal WiFi (RSSI dBm) -> label + ikon
+function signalInfo(rssi) {
+  if (rssi == null) return { label: "-", Icon: SignalZero, color: "rgba(255,255,255,0.3)" };
+  if (rssi >= -55) return { label: "Sangat baik", Icon: SignalHigh, color: "#6ee7b7" };
+  if (rssi >= -65) return { label: "Baik", Icon: SignalHigh, color: "#6ee7b7" };
+  if (rssi >= -75) return { label: "Sedang", Icon: SignalMedium, color: "#facc15" };
+  if (rssi >= -85) return { label: "Lemah", Icon: SignalLow, color: "#fb923c" };
+  return { label: "Sangat lemah", Icon: SignalZero, color: "#fb7185" };
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +378,7 @@ const DEFAULT_THRESHOLDS = {
 
 export default function App() {
   const [now, setNow] = useState(new Date());
-  const [current, setCurrent] = useState({ suhu: 26.5, lembap: 58, voc: 180 });
+  const [current, setCurrent] = useState({ suhu: 26.5, lembap: 58, voc: 180, rssi: null });
   const [history, setHistory] = useState(() => {
     const arr = [];
     let s = 26.5,
@@ -600,6 +614,7 @@ export default function App() {
 
   // ------ Status online/offline ESP32-CAM (heartbeat tiap 10 detik) ------
   const [camLastSeen, setCamLastSeen] = useState(null);
+  const [camRssi, setCamRssi] = useState(null);
   const CAM_ONLINE_THRESHOLD_SEC = 30; // heartbeat tiap 10 detik, kasih margin 3x lipat
 
   useEffect(() => {
@@ -607,11 +622,12 @@ export default function App() {
 
     supabase
       .from("camera_status")
-      .select("last_seen")
+      .select("last_seen,rssi")
       .eq("id", 1)
       .maybeSingle()
       .then(({ data }) => {
         if (data?.last_seen) setCamLastSeen(new Date(data.last_seen));
+        if (data?.rssi != null) setCamRssi(data.rssi);
       });
 
     const channel = supabase
@@ -621,6 +637,7 @@ export default function App() {
         { event: "UPDATE", schema: "public", table: "camera_status" },
         (payload) => {
           if (payload.new?.last_seen) setCamLastSeen(new Date(payload.new.last_seen));
+          if (payload.new?.rssi != null) setCamRssi(payload.new.rssi);
         }
       )
       .subscribe();
@@ -796,7 +813,7 @@ export default function App() {
     async function loadHistory() {
       const { data, error } = await supabase
         .from("sensor_readings")
-        .select("suhu,lembap,voc,created_at")
+        .select("suhu,lembap,voc,rssi,created_at")
         .order("created_at", { ascending: false })
         .limit(HISTORY_LEN);
 
@@ -1206,22 +1223,41 @@ export default function App() {
 
       {/* status sistem */}
       <div className="mx-auto max-w-[1360px] px-6 mt-5 grid grid-cols-1 sm:grid-cols-3 gap-5">
-        <Glass className="px-5 py-4 flex items-center gap-3">
-          <div
-            className="h-9 w-9 rounded-2xl flex items-center justify-center border shrink-0"
-            style={{
-              borderColor: deviceOnline ? "rgba(110,231,183,0.3)" : "rgba(251,113,133,0.3)",
-              background: deviceOnline ? "rgba(110,231,183,0.1)" : "rgba(251,113,133,0.1)",
-            }}
-          >
-            <Radio size={16} style={{ color: deviceOnline ? "#6ee7b7" : "#fb7185" }} />
-          </div>
-          <div>
-            <div className="text-[13px] text-white/45">Perangkat</div>
-            <div className="text-[14.5px] font-medium" style={{ color: deviceOnline ? "#6ee7b7" : "#fb7185" }}>
-              {deviceOnline ? "Online" : "Offline"}
+        <Glass className="px-5 py-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div
+              className="h-9 w-9 rounded-2xl flex items-center justify-center border shrink-0"
+              style={{
+                borderColor: deviceOnline ? "rgba(110,231,183,0.3)" : "rgba(251,113,133,0.3)",
+                background: deviceOnline ? "rgba(110,231,183,0.1)" : "rgba(251,113,133,0.1)",
+              }}
+            >
+              <Radio size={16} style={{ color: deviceOnline ? "#6ee7b7" : "#fb7185" }} />
+            </div>
+            <div>
+              <div className="text-[13px] text-white/45">Perangkat</div>
+              <div className="text-[14.5px] font-medium" style={{ color: deviceOnline ? "#6ee7b7" : "#fb7185" }}>
+                {deviceOnline ? "Online" : "Offline"}
+              </div>
             </div>
           </div>
+          {deviceOnline && current.rssi != null && (
+            <div className="flex items-center gap-1.5 text-right" title={`${current.rssi} dBm`}>
+              {(() => {
+                const sig = signalInfo(current.rssi);
+                const SigIcon = sig.Icon;
+                return (
+                  <>
+                    <div>
+                      <div className="text-[12px] text-white/50 leading-tight">{sig.label}</div>
+                      <div className="text-[11px] text-white/30 tabular">{current.rssi} dBm</div>
+                    </div>
+                    <SigIcon size={16} style={{ color: sig.color }} />
+                  </>
+                );
+              })()}
+            </div>
+          )}
         </Glass>
 
         <Glass className="px-5 py-4 flex items-center gap-3">
@@ -1650,6 +1686,7 @@ export default function App() {
                 >
                   <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" />
                   ESP32-CAM {camOnline ? "online" : "offline"}
+                  {camOnline && camRssi != null && ` · ${camRssi} dBm`}
                 </div>
                 <button
                   onClick={handleCaptureNow}
