@@ -156,6 +156,17 @@ function signalInfo(rssi) {
   return { label: "Sangat lemah", Icon: SignalZero, color: "#fb7185" };
 }
 
+function numberOrDefault(value, fallback) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function sameRange(a, b) {
+  if (!a || !b) return false;
+  return Object.keys(a).every((key) => a[key] === b[key]);
+}
+
 // ---------------------------------------------------------------------------
 // Sub-komponen: Ring gauge
 // ---------------------------------------------------------------------------
@@ -385,6 +396,15 @@ const DEFAULT_THRESHOLDS = {
   vocMax: 400,
 };
 
+const DEFAULT_BUSUK_THRESHOLDS = {
+  vocMin: 0,
+  vocMax: 500,
+  suhuMin: 15,
+  suhuMax: 30,
+  lembapMin: 50,
+  lembapMax: 85,
+};
+
 export default function App() {
   const [now, setNow] = useState(new Date());
   const [current, setCurrent] = useState({ suhu: 26.5, lembap: 58, voc: 180, rssi: null, tegangan_panel: 12.6 });
@@ -405,7 +425,21 @@ export default function App() {
     return arr;
   });
 
+  // Setting AKTIF = nilai terakhir yang berhasil tersimpan di Supabase.
+  // Draft = nilai slider yang sedang diedit user dan belum disimpan.
   const [thresholds, setThresholds] = useState(DEFAULT_THRESHOLDS);
+  const [thresholdDraft, setThresholdDraft] = useState(DEFAULT_THRESHOLDS);
+  const [busukThresholds, setBusukThresholds] = useState(DEFAULT_BUSUK_THRESHOLDS);
+  const [busukDraft, setBusukDraft] = useState(DEFAULT_BUSUK_THRESHOLDS);
+
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
+  const [idealSaveStatus, setIdealSaveStatus] = useState("idle"); // idle | saving | success | error
+  const [busukSaveStatus, setBusukSaveStatus] = useState("idle"); // idle | saving | success | error
+
+  const idealDirty = useMemo(() => !sameRange(thresholdDraft, thresholds), [thresholdDraft, thresholds]);
+  const busukDirty = useMemo(() => !sameRange(busukDraft, busukThresholds), [busukDraft, busukThresholds]);
 
   const [fanMode, setFanMode] = useState("auto"); // auto | manual
   const [fanManualOn, setFanManualOn] = useState(false);
@@ -444,6 +478,178 @@ export default function App() {
     () => (supaConfigured ? createClient(supaUrl.trim(), supaKey.trim()) : null),
     [supaConfigured, supaUrl, supaKey]
   );
+
+  // ---------------------------------------------------------------------------
+  // LOAD pengaturan rentang + mode kipas dari Supabase saat app/device dibuka.
+  // Ini yang membuat setting tidak reset saat pindah browser/device.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!supabase) {
+      setSettingsLoading(false);
+      setSettingsLoaded(true);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadBoxSettings() {
+      setSettingsLoading(true);
+      setSettingsLoaded(false);
+      setSettingsError("");
+
+      try {
+        const { data, error } = await supabase
+          .from("box_settings")
+          .select("*")
+          .eq("id", 1)
+          .maybeSingle();
+
+        if (cancelled) return;
+        if (error) throw error;
+
+        if (data) {
+          const loadedIdeal = {
+            suhuMin: numberOrDefault(data.suhumin, DEFAULT_THRESHOLDS.suhuMin),
+            suhuMax: numberOrDefault(data.suhumax, DEFAULT_THRESHOLDS.suhuMax),
+            lembapMin: numberOrDefault(data.lembapmin, DEFAULT_THRESHOLDS.lembapMin),
+            lembapMax: numberOrDefault(data.lembapmax, DEFAULT_THRESHOLDS.lembapMax),
+            vocMin: numberOrDefault(data.vocmin, DEFAULT_THRESHOLDS.vocMin),
+            vocMax: numberOrDefault(data.vocmax, DEFAULT_THRESHOLDS.vocMax),
+          };
+
+          const loadedBusuk = {
+            vocMin: numberOrDefault(data.busuk_vocmin, DEFAULT_BUSUK_THRESHOLDS.vocMin),
+            vocMax: numberOrDefault(data.busuk_vocmax, DEFAULT_BUSUK_THRESHOLDS.vocMax),
+            suhuMin: numberOrDefault(data.busuk_suhumin, DEFAULT_BUSUK_THRESHOLDS.suhuMin),
+            suhuMax: numberOrDefault(data.busuk_suhumax, DEFAULT_BUSUK_THRESHOLDS.suhuMax),
+            lembapMin: numberOrDefault(data.busuk_lembapmin, DEFAULT_BUSUK_THRESHOLDS.lembapMin),
+            lembapMax: numberOrDefault(data.busuk_lembapmax, DEFAULT_BUSUK_THRESHOLDS.lembapMax),
+          };
+
+          setThresholds(loadedIdeal);
+          setThresholdDraft(loadedIdeal);
+          setBusukThresholds(loadedBusuk);
+          setBusukDraft(loadedBusuk);
+
+          if (data.fan_mode === "auto" || data.fan_mode === "manual") {
+            setFanMode(data.fan_mode);
+          }
+          if (typeof data.fan_manual_on === "boolean") {
+            setFanManualOn(data.fan_manual_on);
+          }
+        }
+
+        setSettingsLoaded(true);
+        setSupaStatus("ok");
+      } catch (err) {
+        console.error("Gagal memuat box_settings:", err);
+        if (!cancelled) {
+          setSettingsError(err?.message || "Gagal memuat pengaturan dari Supabase.");
+          // Jangan izinkan write kalau SELECT gagal; mencegah default browser menimpa DB.
+          setSettingsLoaded(false);
+          setSupaStatus("error");
+        }
+      } finally {
+        if (!cancelled) setSettingsLoading(false);
+      }
+    }
+
+    loadBoxSettings();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase]);
+
+  // Simpan Rentang Ideal secara eksplisit via tombol Save.
+  const saveIdealSettings = async () => {
+    if (!supabase || !settingsLoaded || !idealDirty || idealSaveStatus === "saving") return;
+
+    setIdealSaveStatus("saving");
+    setSettingsError("");
+
+    try {
+      const { error } = await supabase
+        .from("box_settings")
+        .upsert(
+          {
+            id: 1,
+            suhumin: thresholdDraft.suhuMin,
+            suhumax: thresholdDraft.suhuMax,
+            lembapmin: thresholdDraft.lembapMin,
+            lembapmax: thresholdDraft.lembapMax,
+            vocmin: thresholdDraft.vocMin,
+            vocmax: thresholdDraft.vocMax,
+            busuk_vocmin: busukThresholds.vocMin,
+            busuk_vocmax: busukThresholds.vocMax,
+            busuk_suhumin: busukThresholds.suhuMin,
+            busuk_suhumax: busukThresholds.suhuMax,
+            busuk_lembapmin: busukThresholds.lembapMin,
+            busuk_lembapmax: busukThresholds.lembapMax,
+            fan_mode: fanMode,
+            fan_manual_on: fanManualOn,
+          },
+          { onConflict: "id" }
+        );
+
+      if (error) throw error;
+
+      setThresholds({ ...thresholdDraft });
+      setIdealSaveStatus("success");
+      setSupaStatus("ok");
+      setTimeout(() => setIdealSaveStatus("idle"), 1800);
+    } catch (err) {
+      console.error("Gagal menyimpan rentang ideal:", err);
+      setIdealSaveStatus("error");
+      setSettingsError(err?.message || "Gagal menyimpan rentang ideal.");
+      setSupaStatus("error");
+    }
+  };
+
+  // Simpan Rentang Deteksi Kebusukan secara eksplisit via tombol Save.
+  const saveBusukSettings = async () => {
+    if (!supabase || !settingsLoaded || !busukDirty || busukSaveStatus === "saving") return;
+
+    setBusukSaveStatus("saving");
+    setSettingsError("");
+
+    try {
+      const { error } = await supabase
+        .from("box_settings")
+        .upsert(
+          {
+            id: 1,
+            suhumin: thresholds.suhuMin,
+            suhumax: thresholds.suhuMax,
+            lembapmin: thresholds.lembapMin,
+            lembapmax: thresholds.lembapMax,
+            vocmin: thresholds.vocMin,
+            vocmax: thresholds.vocMax,
+            busuk_vocmin: busukDraft.vocMin,
+            busuk_vocmax: busukDraft.vocMax,
+            busuk_suhumin: busukDraft.suhuMin,
+            busuk_suhumax: busukDraft.suhuMax,
+            busuk_lembapmin: busukDraft.lembapMin,
+            busuk_lembapmax: busukDraft.lembapMax,
+            fan_mode: fanMode,
+            fan_manual_on: fanManualOn,
+          },
+          { onConflict: "id" }
+        );
+
+      if (error) throw error;
+
+      setBusukThresholds({ ...busukDraft });
+      setBusukSaveStatus("success");
+      setSupaStatus("ok");
+      setTimeout(() => setBusukSaveStatus("idle"), 1800);
+    } catch (err) {
+      console.error("Gagal menyimpan rentang deteksi kebusukan:", err);
+      setBusukSaveStatus("error");
+      setSettingsError(err?.message || "Gagal menyimpan rentang deteksi kebusukan.");
+      setSupaStatus("error");
+    }
+  };
 
   // ------ OTA firmware ------
   // Dua device beda punya baris masing-masing di tabel ota_firmware, supaya
@@ -1049,30 +1255,44 @@ export default function App() {
     };
   }, [supabase, fanMode, fanManualOn]);
 
-  // kirim threshold & mode kipas ke tabel box_settings, supaya ESP32 bisa membacanya
-  // dan menjalankan kipas secara lokal (tidak bergantung pada koneksi internet saat itu juga)
+  // Mode kipas tetap tersinkron otomatis ke box_settings.
+  // Threshold TIDAK lagi autosave: threshold hanya berubah permanen setelah tombol Save ditekan.
   useEffect(() => {
-    if (!supabase) return;
+    if (!supabase || !settingsLoaded) return;
+
     const id = setTimeout(() => {
       supabase
         .from("box_settings")
-        .upsert({
-          id: 1,
-          suhumin: thresholds.suhuMin,
-          suhumax: thresholds.suhuMax,
-          lembapmin: thresholds.lembapMin,
-          lembapmax: thresholds.lembapMax,
-          vocmin: thresholds.vocMin,
-          vocmax: thresholds.vocMax,
-          fan_mode: fanMode,
-          fan_manual_on: fanManualOn,
-        })
+        .upsert(
+          {
+            id: 1,
+            suhumin: thresholds.suhuMin,
+            suhumax: thresholds.suhuMax,
+            lembapmin: thresholds.lembapMin,
+            lembapmax: thresholds.lembapMax,
+            vocmin: thresholds.vocMin,
+            vocmax: thresholds.vocMax,
+            busuk_vocmin: busukThresholds.vocMin,
+            busuk_vocmax: busukThresholds.vocMax,
+            busuk_suhumin: busukThresholds.suhuMin,
+            busuk_suhumax: busukThresholds.suhuMax,
+            busuk_lembapmin: busukThresholds.lembapMin,
+            busuk_lembapmax: busukThresholds.lembapMax,
+            fan_mode: fanMode,
+            fan_manual_on: fanManualOn,
+          },
+          { onConflict: "id" }
+        )
         .then(({ error }) => {
-          if (error) setSupaStatus("error");
+          if (error) {
+            console.error("Gagal sinkron mode kipas:", error);
+            setSupaStatus("error");
+          }
         });
-    }, 500);
+    }, 300);
+
     return () => clearTimeout(id);
-  }, [supabase, thresholds, fanMode, fanManualOn]);
+  }, [supabase, settingsLoaded, thresholds, busukThresholds, fanMode, fanManualOn]);
 
   // rekomendasi AI mengikuti data & threshold
   useEffect(() => {
@@ -1112,19 +1332,11 @@ export default function App() {
     ? supaStatus !== "error" && secondsSinceUpdate !== null && secondsSinceUpdate < 30
     : true;
 
-  const setThreshold = (patch) => setThresholds((t) => ({ ...t, ...patch }));
+  // Slider rentang ideal hanya mengubah draft. Nilai aktif berubah setelah Save berhasil.
+  const setThreshold = (patch) => setThresholdDraft((t) => ({ ...t, ...patch }));
 
   // ------ Deteksi kebusukan buah (VOC = indikator utama, suhu & kelembapan = faktor pemicu) ------
-  // Pakai rentang aman (min-max) per parameter — di luar rentang = jadi faktor risiko.
-  const [busukThresholds, setBusukThresholds] = useState({
-    vocMin: 0,
-    vocMax: 500,
-    suhuMin: 15,
-    suhuMax: 30,
-    lembapMin: 50,
-    lembapMax: 85,
-  });
-
+  // Pakai rentang aman yang SUDAH TERSIMPAN (busukThresholds), bukan draft.
   const BUSUK_COLOR = { ideal: "#6ee7b7", waspada: "#facc15", tinggi: "#fb7185" };
 
   const busukStatus = useMemo(() => {
@@ -1626,7 +1838,17 @@ export default function App() {
           <SectionTitle
             icon={ShieldAlert}
             title="Deteksi kebusukan buah"
-            sub="Gabungan VOC, suhu & kelembapan"
+            sub={settingsLoading ? "Memuat pengaturan..." : "Gabungan VOC, suhu & kelembapan"}
+            action={
+              <button
+                onClick={() => setBusukDraft({ ...DEFAULT_BUSUK_THRESHOLDS })}
+                className="h-8 px-3 rounded-full border border-white/10 bg-white/5 flex items-center gap-1.5 text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors text-[12px]"
+                title="Kembalikan ke rentang default"
+              >
+                <RefreshCw size={13} />
+                Reset
+              </button>
+            }
           />
           <div className="px-6 pb-6 pt-3">
             <div
@@ -1653,17 +1875,17 @@ export default function App() {
                     Rentang VOC aman
                   </span>
                   <span className="text-[12.5px] text-white/45 tabular">
-                    {busukThresholds.vocMin} – {busukThresholds.vocMax} ppm
+                    {busukDraft.vocMin} – {busukDraft.vocMax} ppm
                   </span>
                 </div>
                 <DualRange
                   boundsMin={0}
                   boundsMax={1000}
-                  min={busukThresholds.vocMin}
-                  max={busukThresholds.vocMax}
+                  min={busukDraft.vocMin}
+                  max={busukDraft.vocMax}
                   color="#b79cff"
                   step={10}
-                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, vocMin: newMin, vocMax: newMax }))}
+                  onChange={(newMin, newMax) => setBusukDraft((t) => ({ ...t, vocMin: newMin, vocMax: newMax }))}
                 />
               </div>
 
@@ -1674,17 +1896,17 @@ export default function App() {
                     Rentang suhu aman
                   </span>
                   <span className="text-[12.5px] text-white/45 tabular">
-                    {busukThresholds.suhuMin} – {busukThresholds.suhuMax} °C
+                    {busukDraft.suhuMin} – {busukDraft.suhuMax} °C
                   </span>
                 </div>
                 <DualRange
                   boundsMin={10}
                   boundsMax={45}
-                  min={busukThresholds.suhuMin}
-                  max={busukThresholds.suhuMax}
+                  min={busukDraft.suhuMin}
+                  max={busukDraft.suhuMax}
                   color="#ff9466"
                   step={1}
-                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, suhuMin: newMin, suhuMax: newMax }))}
+                  onChange={(newMin, newMax) => setBusukDraft((t) => ({ ...t, suhuMin: newMin, suhuMax: newMax }))}
                 />
               </div>
 
@@ -1695,25 +1917,69 @@ export default function App() {
                     Rentang kelembapan aman
                   </span>
                   <span className="text-[12.5px] text-white/45 tabular">
-                    {busukThresholds.lembapMin} – {busukThresholds.lembapMax} %
+                    {busukDraft.lembapMin} – {busukDraft.lembapMax} %
                   </span>
                 </div>
                 <DualRange
                   boundsMin={20}
                   boundsMax={95}
-                  min={busukThresholds.lembapMin}
-                  max={busukThresholds.lembapMax}
+                  min={busukDraft.lembapMin}
+                  max={busukDraft.lembapMax}
                   color="#5ec8d8"
                   step={1}
-                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, lembapMin: newMin, lembapMax: newMax }))}
+                  onChange={(newMin, newMax) => setBusukDraft((t) => ({ ...t, lembapMin: newMin, lembapMax: newMax }))}
                 />
               </div>
+
+              <div className="flex items-center gap-1.5 text-[11.5px] text-white/35 pt-1">
+                <ChevronRight size={13} />
+                {busukDirty ? "Ada perubahan yang belum disimpan" : "Pengaturan sudah tersimpan"}
+              </div>
+
+              <button
+                onClick={saveBusukSettings}
+                disabled={!supabase || !settingsLoaded || settingsLoading || !busukDirty || busukSaveStatus === "saving"}
+                className="w-full h-11 rounded-xl border flex items-center justify-center gap-2 text-[13px] font-medium transition-all disabled:cursor-not-allowed"
+                style={{
+                  background: busukDirty ? "rgba(110,231,183,0.12)" : "rgba(255,255,255,0.04)",
+                  borderColor: busukDirty ? "rgba(110,231,183,0.32)" : "rgba(255,255,255,0.08)",
+                  color: busukDirty ? "#6ee7b7" : "rgba(255,255,255,0.35)",
+                  opacity: busukSaveStatus === "saving" ? 0.75 : 1,
+                }}
+              >
+                {busukSaveStatus === "saving" ? (
+                  <>
+                    <RefreshCw size={15} className="animate-spin" /> Menyimpan...
+                  </>
+                ) : busukSaveStatus === "success" ? (
+                  <>
+                    <CheckCircle2 size={15} /> Tersimpan
+                  </>
+                ) : busukDirty ? (
+                  <>
+                    <UploadCloud size={15} /> Simpan pengaturan
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 size={15} /> Tersimpan
+                  </>
+                )}
+              </button>
+
+              {busukSaveStatus === "error" && settingsError && (
+                <div className="flex items-start gap-1.5 text-[11.5px] text-rose-300">
+                  <AlertCircle size={13} className="mt-0.5 shrink-0" />
+                  <span>{settingsError}</span>
+                </div>
+              )}
             </div>
 
             <p className="text-[11.5px] text-white/30 mt-4 leading-relaxed">
               VOC adalah indikator utama gas hasil pembusukan. Suhu dan kelembapan di luar rentang aman
               jadi faktor yang mempercepat proses itu — status "Mulai Busuk" muncul kalau suhu atau
               kelembapan keluar dari rentangnya, dan "Busuk" kalau VOC melewati batas atas rentangnya.
+              Geser slider lalu tekan <span className="text-white/45">Simpan pengaturan</span> agar nilai
+              tersimpan di Supabase dan tetap sama saat dashboard dibuka di perangkat lain.
             </p>
           </div>
         </Glass>
@@ -1787,10 +2053,10 @@ export default function App() {
           <SectionTitle
             icon={Settings2}
             title="Rentang ideal"
-            sub="Atur ambang tiap sensor"
+            sub={settingsLoading ? "Memuat pengaturan..." : "Atur ambang tiap sensor"}
             action={
               <button
-                onClick={() => setThresholds(DEFAULT_THRESHOLDS)}
+                onClick={() => setThresholdDraft({ ...DEFAULT_THRESHOLDS })}
                 className="h-8 px-3 rounded-full border border-white/10 bg-white/5 flex items-center gap-1.5 text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors text-[12px]"
                 title="Kembalikan ke rentang default"
               >
@@ -1801,8 +2067,8 @@ export default function App() {
           />
           <div className="px-6 pb-6 pt-3 flex flex-col gap-6">
             {Object.values(METRICS).map((m) => {
-              const min = thresholds[`${m.key}Min`];
-              const max = thresholds[`${m.key}Max`];
+              const min = thresholdDraft[`${m.key}Min`];
+              const max = thresholdDraft[`${m.key}Max`];
               return (
                 <div key={m.key}>
                   <div className="flex items-center justify-between mb-2.5">
@@ -1828,9 +2094,61 @@ export default function App() {
                 </div>
               );
             })}
-            <div className="flex items-center gap-1.5 text-[11.5px] text-white/30 pt-1">
+
+            <div className="flex items-center gap-1.5 text-[11.5px] text-white/35 pt-1">
               <ChevronRight size={13} />
-              Perubahan diterapkan langsung ke logika kipas dan grafik
+              {idealDirty ? "Ada perubahan yang belum disimpan" : "Pengaturan sudah tersimpan"}
+            </div>
+
+            <button
+              onClick={saveIdealSettings}
+              disabled={!supabase || !settingsLoaded || settingsLoading || !idealDirty || idealSaveStatus === "saving"}
+              className="w-full h-11 rounded-xl border flex items-center justify-center gap-2 text-[13px] font-medium transition-all disabled:cursor-not-allowed"
+              style={{
+                background: idealDirty ? "rgba(110,231,183,0.12)" : "rgba(255,255,255,0.04)",
+                borderColor: idealDirty ? "rgba(110,231,183,0.32)" : "rgba(255,255,255,0.08)",
+                color: idealDirty ? "#6ee7b7" : "rgba(255,255,255,0.35)",
+                opacity: idealSaveStatus === "saving" ? 0.75 : 1,
+              }}
+            >
+              {idealSaveStatus === "saving" ? (
+                <>
+                  <RefreshCw size={15} className="animate-spin" /> Menyimpan...
+                </>
+              ) : idealSaveStatus === "success" ? (
+                <>
+                  <CheckCircle2 size={15} /> Tersimpan
+                </>
+              ) : idealDirty ? (
+                <>
+                  <UploadCloud size={15} /> Simpan pengaturan
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 size={15} /> Tersimpan
+                </>
+              )}
+            </button>
+
+            {idealSaveStatus === "error" && settingsError && (
+              <div className="flex items-start gap-1.5 text-[11.5px] text-rose-300">
+                <AlertCircle size={13} className="mt-0.5 shrink-0" />
+                <span>{settingsError}</span>
+              </div>
+            )}
+
+            {!supabase && (
+              <p className="text-[11.5px] text-amber-300/60 leading-relaxed">
+                Hubungkan Supabase untuk menyimpan pengaturan secara permanen.
+              </p>
+            )}
+
+            <div className="flex items-start gap-1.5 text-[11.5px] text-white/30 pt-1 leading-relaxed">
+              <ChevronRight size={13} className="mt-0.5 shrink-0" />
+              <span>
+                Geser slider lalu tekan <span className="text-white/45">Simpan pengaturan</span>. Setelah berhasil,
+                nilai dipakai oleh logika kipas/grafik dan otomatis dimuat lagi saat FreshRay dibuka dari perangkat lain.
+              </span>
             </div>
           </div>
         </Glass>
