@@ -31,6 +31,7 @@ import {
   Lock,
   Unlock,
   Camera,
+  Power,
   RotateCw,
   ShieldAlert,
   Wifi,
@@ -446,6 +447,12 @@ export default function App() {
   const fanOnRef = useRef(false);
   const [fanOn, setFanOn] = useState(false);
 
+  // Daya ESP32-CAM dikendalikan oleh ESP32 utama lewat GPIO14.
+  // Nilainya disimpan di box_settings supaya konsisten di semua device/browser.
+  const [camPowerOn, setCamPowerOn] = useState(false);
+  const [camPowerSaving, setCamPowerSaving] = useState(false);
+  const [camPowerError, setCamPowerError] = useState("");
+
   const [activeTab, setActiveTab] = useState("suhu");
 
   const [tick, setTick] = useState(0);
@@ -537,6 +544,9 @@ export default function App() {
           if (typeof data.fan_manual_on === "boolean") {
             setFanManualOn(data.fan_manual_on);
           }
+          if (typeof data.cam_power_on === "boolean") {
+            setCamPowerOn(data.cam_power_on);
+          }
         }
 
         setSettingsLoaded(true);
@@ -588,6 +598,7 @@ export default function App() {
             busuk_lembapmax: busukThresholds.lembapMax,
             fan_mode: fanMode,
             fan_manual_on: fanManualOn,
+            cam_power_on: camPowerOn,
           },
           { onConflict: "id" }
         );
@@ -633,6 +644,7 @@ export default function App() {
             busuk_lembapmax: busukDraft.lembapMax,
             fan_mode: fanMode,
             fan_manual_on: fanManualOn,
+            cam_power_on: camPowerOn,
           },
           { onConflict: "id" }
         );
@@ -648,6 +660,41 @@ export default function App() {
       setBusukSaveStatus("error");
       setSettingsError(err?.message || "Gagal menyimpan rentang deteksi kebusukan.");
       setSupaStatus("error");
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Daya ESP32-CAM
+  // Web -> box_settings.cam_power_on -> ESP32 utama polling -> GPIO14 HIGH/LOW.
+  // ---------------------------------------------------------------------------
+  const handleCamPowerToggle = async () => {
+    if (!supabase || !settingsLoaded || camPowerSaving) return;
+
+    const nextValue = !camPowerOn;
+    setCamPowerSaving(true);
+    setCamPowerError("");
+
+    try {
+      const { error } = await supabase
+        .from("box_settings")
+        .upsert(
+          {
+            id: 1,
+            cam_power_on: nextValue,
+          },
+          { onConflict: "id" }
+        );
+
+      if (error) throw error;
+
+      setCamPowerOn(nextValue);
+      setSupaStatus("ok");
+    } catch (err) {
+      console.error("Gagal mengubah daya ESP32-CAM:", err);
+      setCamPowerError(err?.message || "Gagal mengubah daya ESP32-CAM.");
+      setSupaStatus("error");
+    } finally {
+      setCamPowerSaving(false);
     }
   };
 
@@ -1394,11 +1441,11 @@ export default function App() {
     if (supaConfigured && !deviceOnline) {
       list.push({ key: "device-offline", text: "ESP32 (sensor + kipas) offline — tidak ada data baru." });
     }
-    if (supaConfigured && camLastSeen && !camOnline) {
-      list.push({ key: "cam-offline", text: "ESP32-CAM offline — heartbeat terakhir terlalu lama." });
+    if (supaConfigured && camPowerOn && camLastSeen && !camOnline) {
+      list.push({ key: "cam-offline", text: "ESP32-CAM offline — daya sudah ON tetapi heartbeat terakhir terlalu lama." });
     }
     return list;
-  }, [busukStatus, supaConfigured, deviceOnline, camOnline, camLastSeen]);
+  }, [busukStatus, supaConfigured, deviceOnline, camPowerOn, camOnline, camLastSeen]);
 
   // notifikasi browser (opsional) — sekali per kejadian, bukan tiap render
   const [notifEnabled, setNotifEnabled] = useState(false);
@@ -2227,23 +2274,47 @@ export default function App() {
             title="Snapshot kamera"
             sub="Foto berkala tiap 30 menit — live stream dinonaktifkan agar capture lebih stabil"
             action={
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                <button
+                  onClick={handleCamPowerToggle}
+                  disabled={!supaConfigured || !settingsLoaded || settingsLoading || camPowerSaving}
+                  className="h-8 px-3 rounded-full border flex items-center gap-1.5 text-[12px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={{
+                    color: camPowerOn ? "#fb7185" : "#6ee7b7",
+                    borderColor: camPowerOn ? "rgba(251,113,133,0.3)" : "rgba(110,231,183,0.3)",
+                    background: camPowerOn ? "rgba(251,113,133,0.1)" : "rgba(110,231,183,0.1)",
+                  }}
+                  title={camPowerOn ? "Matikan daya ESP32-CAM" : "Nyalakan daya ESP32-CAM"}
+                >
+                  <Power size={13} />
+                  {camPowerSaving ? "Mengirim…" : camPowerOn ? "Matikan CAM" : "Nyalakan CAM"}
+                </button>
+
                 <div
                   className="flex items-center gap-1.5 rounded-full px-2.5 py-1 border text-[11.5px]"
                   style={{
-                    color: camOnline ? "#6ee7b7" : "#fb7185",
-                    borderColor: camOnline ? "rgba(110,231,183,0.25)" : "rgba(251,113,133,0.25)",
-                    background: camOnline ? "rgba(110,231,183,0.08)" : "rgba(251,113,133,0.08)",
+                    color: !camPowerOn ? "rgba(255,255,255,0.45)" : camOnline ? "#6ee7b7" : "#fb7185",
+                    borderColor: !camPowerOn
+                      ? "rgba(255,255,255,0.12)"
+                      : camOnline
+                      ? "rgba(110,231,183,0.25)"
+                      : "rgba(251,113,133,0.25)",
+                    background: !camPowerOn
+                      ? "rgba(255,255,255,0.05)"
+                      : camOnline
+                      ? "rgba(110,231,183,0.08)"
+                      : "rgba(251,113,133,0.08)",
                   }}
                   title={camLastSeen ? `Heartbeat terakhir ${formatClock(camLastSeen)}` : "Belum ada heartbeat"}
                 >
-                  <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" />
-                  ESP32-CAM {camOnline ? "online" : "offline"}
+                  <span className={`h-1.5 w-1.5 rounded-full bg-current ${camPowerOn ? "animate-pulse" : ""}`} />
+                  ESP32-CAM {!camPowerOn ? "dimatikan" : camOnline ? "online" : "booting / offline"}
                   {camOnline && camRssi != null && ` · ${camRssi} dBm`}
                 </div>
+
                 <button
                   onClick={handleCaptureNow}
-                  disabled={!supaConfigured || !camOnline || snapshotWaiting}
+                  disabled={!supaConfigured || !camPowerOn || !camOnline || snapshotWaiting}
                   className="h-8 px-3 rounded-full border border-cyan-300/25 bg-cyan-300/15 flex items-center gap-1.5 text-cyan-200 hover:bg-cyan-300/25 transition-colors text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <RotateCw size={13} className={snapshotWaiting ? "animate-spin" : ""} />
@@ -2253,6 +2324,13 @@ export default function App() {
             }
           />
           <div className="px-6 pb-6 pt-3">
+            {camPowerError && (
+              <div className="mb-3 flex items-center gap-1.5 text-[12px] text-rose-300">
+                <AlertCircle size={13} />
+                {camPowerError}
+              </div>
+            )}
+
             <div className="aspect-video rounded-2xl bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center">
               {snapshotViewing || latestSnapshot ? (
                 <img
@@ -2352,10 +2430,13 @@ export default function App() {
             ) : null}
 
             <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
-              ESP32-CAM ambil foto otomatis tiap 30 menit dan upload ke Supabase — jalan lewat internet
-              biasa, tidak butuh port forwarding, Tailscale, atau berada di jaringan yang sama. Tombol
-              "Ambil sekarang" minta ESP32-CAM memotret di luar jadwal itu. Klik salah satu thumbnail di
-              bawah untuk lihat riwayat {SNAPSHOT_HISTORY_LIMIT} foto terakhir.
+              Tombol "Nyalakan CAM" / "Matikan CAM" mengubah GPIO14 di ESP32 utama lewat Supabase;
+              karena ESP32 utama mengambil box_settings tiap 10 detik, perubahan daya bisa butuh beberapa detik.
+              Setelah ESP32-CAM boot dan heartbeat masuk, status akan berubah menjadi online. ESP32-CAM ambil
+              foto otomatis tiap 30 menit dan upload ke Supabase — jalan lewat internet biasa, tidak butuh port
+              forwarding, Tailscale, atau berada di jaringan yang sama. Tombol "Ambil sekarang" minta ESP32-CAM
+              memotret di luar jadwal itu. Klik salah satu thumbnail di bawah untuk lihat riwayat
+              {SNAPSHOT_HISTORY_LIMIT} foto terakhir.
             </p>
           </div>
         </Glass>
