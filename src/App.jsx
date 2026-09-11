@@ -728,17 +728,28 @@ export default function App() {
 
     const zip = new JSZip();
     let gagal = 0;
+    const manifest = [];
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
       setPhotoDownloadProgress(`Mengunduh foto ${i + 1}/${data.length}...`);
+      // nama file jadi tanggal-jam yang kebaca langsung, bukan angka epoch mentah
+      const d = new Date(row.captured_at);
+      const pad = (n) => String(n).padStart(2, "0");
+      const namaFile = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(
+        d.getMinutes()
+      )}-${pad(d.getSeconds())}_${row.source}.jpg`;
       try {
         const res = await fetch(row.url);
         if (!res.ok) throw new Error("HTTP " + res.status);
         const blob = await res.blob();
-        zip.file(row.path || `foto-${i + 1}.jpg`, blob);
+        zip.file(namaFile, blob);
+        manifest.push({ file: namaFile, captured_at: row.captured_at, source: row.source });
       } catch {
         gagal++;
       }
+    }
+    if (manifest.length > 0) {
+      zip.file("daftar-foto.csv", toCSV(manifest, ["file", "captured_at", "source"]));
     }
 
     setPhotoDownloadProgress("Membuat file ZIP...");
