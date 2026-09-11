@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
+import JSZip from "jszip";
 import {
   AreaChart,
   Area,
@@ -31,7 +32,6 @@ import {
   Lock,
   Unlock,
   Camera,
-  Power,
   RotateCw,
   ShieldAlert,
   Wifi,
@@ -46,6 +46,9 @@ import {
   Sun,
   BatteryCharging,
   Terminal,
+  Download,
+  FileDown,
+  Archive,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -147,6 +150,31 @@ function formatBytes(rows) {
   return `${mb.toFixed(mb < 10 ? 2 : 1)} MB`;
 }
 
+// ubah array of object jadi teks CSV (escape koma/kutip/baris baru dengan benar)
+function toCSV(rows, columns) {
+  const escape = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const header = columns.join(",");
+  const lines = rows.map((r) => columns.map((c) => escape(r[c])).join(","));
+  return [header, ...lines].join("\n");
+}
+
+// trigger download file di browser dari konten (Blob/string)
+function downloadBlob(content, filename, type) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // kekuatan sinyal WiFi (RSSI dBm) -> label + ikon
 function signalInfo(rssi) {
   if (rssi == null) return { label: "-", Icon: SignalZero, color: "rgba(255,255,255,0.3)" };
@@ -155,17 +183,6 @@ function signalInfo(rssi) {
   if (rssi >= -75) return { label: "Sedang", Icon: SignalMedium, color: "#facc15" };
   if (rssi >= -85) return { label: "Lemah", Icon: SignalLow, color: "#fb923c" };
   return { label: "Sangat lemah", Icon: SignalZero, color: "#fb7185" };
-}
-
-function numberOrDefault(value, fallback) {
-  if (value === null || value === undefined || value === "") return fallback;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function sameRange(a, b) {
-  if (!a || !b) return false;
-  return Object.keys(a).every((key) => a[key] === b[key]);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,15 +414,6 @@ const DEFAULT_THRESHOLDS = {
   vocMax: 400,
 };
 
-const DEFAULT_BUSUK_THRESHOLDS = {
-  vocMin: 0,
-  vocMax: 500,
-  suhuMin: 15,
-  suhuMax: 30,
-  lembapMin: 50,
-  lembapMax: 85,
-};
-
 export default function App() {
   const [now, setNow] = useState(new Date());
   const [current, setCurrent] = useState({ suhu: 26.5, lembap: 58, voc: 180, rssi: null, tegangan_panel: 12.6 });
@@ -426,32 +434,12 @@ export default function App() {
     return arr;
   });
 
-  // Setting AKTIF = nilai terakhir yang berhasil tersimpan di Supabase.
-  // Draft = nilai slider yang sedang diedit user dan belum disimpan.
   const [thresholds, setThresholds] = useState(DEFAULT_THRESHOLDS);
-  const [thresholdDraft, setThresholdDraft] = useState(DEFAULT_THRESHOLDS);
-  const [busukThresholds, setBusukThresholds] = useState(DEFAULT_BUSUK_THRESHOLDS);
-  const [busukDraft, setBusukDraft] = useState(DEFAULT_BUSUK_THRESHOLDS);
-
-  const [settingsLoading, setSettingsLoading] = useState(false);
-  const [settingsLoaded, setSettingsLoaded] = useState(false);
-  const [settingsError, setSettingsError] = useState("");
-  const [idealSaveStatus, setIdealSaveStatus] = useState("idle"); // idle | saving | success | error
-  const [busukSaveStatus, setBusukSaveStatus] = useState("idle"); // idle | saving | success | error
-
-  const idealDirty = useMemo(() => !sameRange(thresholdDraft, thresholds), [thresholdDraft, thresholds]);
-  const busukDirty = useMemo(() => !sameRange(busukDraft, busukThresholds), [busukDraft, busukThresholds]);
 
   const [fanMode, setFanMode] = useState("auto"); // auto | manual
   const [fanManualOn, setFanManualOn] = useState(false);
   const fanOnRef = useRef(false);
   const [fanOn, setFanOn] = useState(false);
-
-  // Daya ESP32-CAM dikendalikan oleh ESP32 utama lewat GPIO14.
-  // Nilainya disimpan di box_settings supaya konsisten di semua device/browser.
-  const [camPowerOn, setCamPowerOn] = useState(false);
-  const [camPowerSaving, setCamPowerSaving] = useState(false);
-  const [camPowerError, setCamPowerError] = useState("");
 
   const [activeTab, setActiveTab] = useState("suhu");
 
@@ -485,218 +473,6 @@ export default function App() {
     () => (supaConfigured ? createClient(supaUrl.trim(), supaKey.trim()) : null),
     [supaConfigured, supaUrl, supaKey]
   );
-
-  // ---------------------------------------------------------------------------
-  // LOAD pengaturan rentang + mode kipas dari Supabase saat app/device dibuka.
-  // Ini yang membuat setting tidak reset saat pindah browser/device.
-  // ---------------------------------------------------------------------------
-  useEffect(() => {
-    if (!supabase) {
-      setSettingsLoading(false);
-      setSettingsLoaded(true);
-      return;
-    }
-
-    let cancelled = false;
-
-    async function loadBoxSettings() {
-      setSettingsLoading(true);
-      setSettingsLoaded(false);
-      setSettingsError("");
-
-      try {
-        const { data, error } = await supabase
-          .from("box_settings")
-          .select("*")
-          .eq("id", 1)
-          .maybeSingle();
-
-        if (cancelled) return;
-        if (error) throw error;
-
-        if (data) {
-          const loadedIdeal = {
-            suhuMin: numberOrDefault(data.suhumin, DEFAULT_THRESHOLDS.suhuMin),
-            suhuMax: numberOrDefault(data.suhumax, DEFAULT_THRESHOLDS.suhuMax),
-            lembapMin: numberOrDefault(data.lembapmin, DEFAULT_THRESHOLDS.lembapMin),
-            lembapMax: numberOrDefault(data.lembapmax, DEFAULT_THRESHOLDS.lembapMax),
-            vocMin: numberOrDefault(data.vocmin, DEFAULT_THRESHOLDS.vocMin),
-            vocMax: numberOrDefault(data.vocmax, DEFAULT_THRESHOLDS.vocMax),
-          };
-
-          const loadedBusuk = {
-            vocMin: numberOrDefault(data.busuk_vocmin, DEFAULT_BUSUK_THRESHOLDS.vocMin),
-            vocMax: numberOrDefault(data.busuk_vocmax, DEFAULT_BUSUK_THRESHOLDS.vocMax),
-            suhuMin: numberOrDefault(data.busuk_suhumin, DEFAULT_BUSUK_THRESHOLDS.suhuMin),
-            suhuMax: numberOrDefault(data.busuk_suhumax, DEFAULT_BUSUK_THRESHOLDS.suhuMax),
-            lembapMin: numberOrDefault(data.busuk_lembapmin, DEFAULT_BUSUK_THRESHOLDS.lembapMin),
-            lembapMax: numberOrDefault(data.busuk_lembapmax, DEFAULT_BUSUK_THRESHOLDS.lembapMax),
-          };
-
-          setThresholds(loadedIdeal);
-          setThresholdDraft(loadedIdeal);
-          setBusukThresholds(loadedBusuk);
-          setBusukDraft(loadedBusuk);
-
-          if (data.fan_mode === "auto" || data.fan_mode === "manual") {
-            setFanMode(data.fan_mode);
-          }
-          if (typeof data.fan_manual_on === "boolean") {
-            setFanManualOn(data.fan_manual_on);
-          }
-          if (typeof data.cam_power_on === "boolean") {
-            setCamPowerOn(data.cam_power_on);
-          }
-        }
-
-        setSettingsLoaded(true);
-        setSupaStatus("ok");
-      } catch (err) {
-        console.error("Gagal memuat box_settings:", err);
-        if (!cancelled) {
-          setSettingsError(err?.message || "Gagal memuat pengaturan dari Supabase.");
-          // Jangan izinkan write kalau SELECT gagal; mencegah default browser menimpa DB.
-          setSettingsLoaded(false);
-          setSupaStatus("error");
-        }
-      } finally {
-        if (!cancelled) setSettingsLoading(false);
-      }
-    }
-
-    loadBoxSettings();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [supabase]);
-
-  // Simpan Rentang Ideal secara eksplisit via tombol Save.
-  const saveIdealSettings = async () => {
-    if (!supabase || !settingsLoaded || !idealDirty || idealSaveStatus === "saving") return;
-
-    setIdealSaveStatus("saving");
-    setSettingsError("");
-
-    try {
-      const { error } = await supabase
-        .from("box_settings")
-        .upsert(
-          {
-            id: 1,
-            suhumin: thresholdDraft.suhuMin,
-            suhumax: thresholdDraft.suhuMax,
-            lembapmin: thresholdDraft.lembapMin,
-            lembapmax: thresholdDraft.lembapMax,
-            vocmin: thresholdDraft.vocMin,
-            vocmax: thresholdDraft.vocMax,
-            busuk_vocmin: busukThresholds.vocMin,
-            busuk_vocmax: busukThresholds.vocMax,
-            busuk_suhumin: busukThresholds.suhuMin,
-            busuk_suhumax: busukThresholds.suhuMax,
-            busuk_lembapmin: busukThresholds.lembapMin,
-            busuk_lembapmax: busukThresholds.lembapMax,
-            fan_mode: fanMode,
-            fan_manual_on: fanManualOn,
-            cam_power_on: camPowerOn,
-          },
-          { onConflict: "id" }
-        );
-
-      if (error) throw error;
-
-      setThresholds({ ...thresholdDraft });
-      setIdealSaveStatus("success");
-      setSupaStatus("ok");
-      setTimeout(() => setIdealSaveStatus("idle"), 1800);
-    } catch (err) {
-      console.error("Gagal menyimpan rentang ideal:", err);
-      setIdealSaveStatus("error");
-      setSettingsError(err?.message || "Gagal menyimpan rentang ideal.");
-      setSupaStatus("error");
-    }
-  };
-
-  // Simpan Rentang Deteksi Kebusukan secara eksplisit via tombol Save.
-  const saveBusukSettings = async () => {
-    if (!supabase || !settingsLoaded || !busukDirty || busukSaveStatus === "saving") return;
-
-    setBusukSaveStatus("saving");
-    setSettingsError("");
-
-    try {
-      const { error } = await supabase
-        .from("box_settings")
-        .upsert(
-          {
-            id: 1,
-            suhumin: thresholds.suhuMin,
-            suhumax: thresholds.suhuMax,
-            lembapmin: thresholds.lembapMin,
-            lembapmax: thresholds.lembapMax,
-            vocmin: thresholds.vocMin,
-            vocmax: thresholds.vocMax,
-            busuk_vocmin: busukDraft.vocMin,
-            busuk_vocmax: busukDraft.vocMax,
-            busuk_suhumin: busukDraft.suhuMin,
-            busuk_suhumax: busukDraft.suhuMax,
-            busuk_lembapmin: busukDraft.lembapMin,
-            busuk_lembapmax: busukDraft.lembapMax,
-            fan_mode: fanMode,
-            fan_manual_on: fanManualOn,
-            cam_power_on: camPowerOn,
-          },
-          { onConflict: "id" }
-        );
-
-      if (error) throw error;
-
-      setBusukThresholds({ ...busukDraft });
-      setBusukSaveStatus("success");
-      setSupaStatus("ok");
-      setTimeout(() => setBusukSaveStatus("idle"), 1800);
-    } catch (err) {
-      console.error("Gagal menyimpan rentang deteksi kebusukan:", err);
-      setBusukSaveStatus("error");
-      setSettingsError(err?.message || "Gagal menyimpan rentang deteksi kebusukan.");
-      setSupaStatus("error");
-    }
-  };
-
-  // ---------------------------------------------------------------------------
-  // Daya ESP32-CAM
-  // Web -> box_settings.cam_power_on -> ESP32 utama polling -> GPIO14 HIGH/LOW.
-  // ---------------------------------------------------------------------------
-  const handleCamPowerToggle = async () => {
-    if (!supabase || !settingsLoaded || camPowerSaving) return;
-
-    const nextValue = !camPowerOn;
-    setCamPowerSaving(true);
-    setCamPowerError("");
-
-    try {
-      const { error } = await supabase
-        .from("box_settings")
-        .upsert(
-          {
-            id: 1,
-            cam_power_on: nextValue,
-          },
-          { onConflict: "id" }
-        );
-
-      if (error) throw error;
-
-      setCamPowerOn(nextValue);
-      setSupaStatus("ok");
-    } catch (err) {
-      console.error("Gagal mengubah daya ESP32-CAM:", err);
-      setCamPowerError(err?.message || "Gagal mengubah daya ESP32-CAM.");
-      setSupaStatus("error");
-    } finally {
-      setCamPowerSaving(false);
-    }
-  };
 
   // ------ OTA firmware ------
   // Dua device beda punya baris masing-masing di tabel ota_firmware, supaya
@@ -899,40 +675,103 @@ export default function App() {
     setLogLoading(false);
   };
 
+  // ------ Unduh data 3 hari terakhir (sensor CSV + foto ZIP) ------
+  const [downloadingSensor, setDownloadingSensor] = useState(false);
+  const [downloadingPhotos, setDownloadingPhotos] = useState(false);
+  const [photoDownloadProgress, setPhotoDownloadProgress] = useState("");
+
+  const dateStr = (d) => d.toISOString().slice(0, 10); // "YYYY-MM-DD"
+  const [downloadStart, setDownloadStart] = useState(dateStr(new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)));
+  const [downloadEnd, setDownloadEnd] = useState(dateStr(new Date()));
+
+  const handleDownloadSensorCSV = async () => {
+    if (!supabase) return;
+    setDownloadingSensor(true);
+    const startISO = `${downloadStart}T00:00:00`;
+    const endISO = `${downloadEnd}T23:59:59.999`;
+    const { data, error } = await supabase
+      .from("sensor_readings")
+      .select("created_at,suhu,lembap,voc,rssi,tegangan_panel")
+      .gte("created_at", startISO)
+      .lte("created_at", endISO)
+      .order("created_at", { ascending: true });
+    setDownloadingSensor(false);
+
+    if (error || !data?.length) {
+      alert(error ? "Gagal mengambil data: " + error.message : "Tidak ada data sensor pada rentang tanggal itu.");
+      return;
+    }
+    const csv = toCSV(data, ["created_at", "suhu", "lembap", "voc", "rssi", "tegangan_panel"]);
+    downloadBlob(csv, `sensor-${downloadStart}_${downloadEnd}.csv`, "text/csv;charset=utf-8;");
+  };
+
+  const handleDownloadPhotosZip = async () => {
+    if (!supabase) return;
+    setDownloadingPhotos(true);
+    setPhotoDownloadProgress("Mengambil daftar foto...");
+
+    const startISO = `${downloadStart}T00:00:00`;
+    const endISO = `${downloadEnd}T23:59:59.999`;
+    const { data, error } = await supabase
+      .from("camera_snapshots")
+      .select("url,path,captured_at,source")
+      .gte("captured_at", startISO)
+      .lte("captured_at", endISO)
+      .order("captured_at", { ascending: true });
+
+    if (error || !data?.length) {
+      setDownloadingPhotos(false);
+      setPhotoDownloadProgress("");
+      alert(error ? "Gagal mengambil daftar foto: " + error.message : "Tidak ada foto pada rentang tanggal itu.");
+      return;
+    }
+
+    const zip = new JSZip();
+    let gagal = 0;
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      setPhotoDownloadProgress(`Mengunduh foto ${i + 1}/${data.length}...`);
+      try {
+        const res = await fetch(row.url);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const blob = await res.blob();
+        zip.file(row.path || `foto-${i + 1}.jpg`, blob);
+      } catch {
+        gagal++;
+      }
+    }
+
+    setPhotoDownloadProgress("Membuat file ZIP...");
+    const content = await zip.generateAsync({ type: "blob" });
+    downloadBlob(content, `foto-${downloadStart}_${downloadEnd}.zip`, "application/zip");
+
+    setDownloadingPhotos(false);
+    setPhotoDownloadProgress(gagal > 0 ? `Selesai, ${gagal} foto gagal diunduh (dilewati).` : "");
+  };
+
   // ------ Status online/offline ESP32-CAM (heartbeat tiap 10 detik) ------
   const [camLastSeen, setCamLastSeen] = useState(null);
   const [camRssi, setCamRssi] = useState(null);
   const CAM_ONLINE_THRESHOLD_SEC = 30; // heartbeat tiap 10 detik, kasih margin 3x lipat
 
-  const fetchCameraStatus = useCallback(async () => {
-    if (!supabase) return;
-
-    const { data, error } = await supabase
-      .from("camera_status")
-      .select("last_seen,rssi")
-      .eq("id", 1)
-      .maybeSingle();
-
-    if (error) {
-      console.error("Gagal membaca status ESP32-CAM:", error);
-      return;
-    }
-
-    if (data?.last_seen) setCamLastSeen(new Date(data.last_seen));
-    if (data?.rssi != null) setCamRssi(data.rssi);
-  }, [supabase]);
-
   useEffect(() => {
     if (!supabase) return;
 
-    fetchCameraStatus();
-    const id = setInterval(fetchCameraStatus, 10000);
+    supabase
+      .from("camera_status")
+      .select("last_seen,rssi")
+      .eq("id", 1)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data?.last_seen) setCamLastSeen(new Date(data.last_seen));
+        if (data?.rssi != null) setCamRssi(data.rssi);
+      });
 
     const channel = supabase
       .channel("camera-status-live")
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "camera_status", filter: "id=eq.1" },
+        { event: "UPDATE", schema: "public", table: "camera_status" },
         (payload) => {
           if (payload.new?.last_seen) setCamLastSeen(new Date(payload.new.last_seen));
           if (payload.new?.rssi != null) setCamRssi(payload.new.rssi);
@@ -941,27 +780,22 @@ export default function App() {
       .subscribe();
 
     return () => {
-      clearInterval(id);
       supabase.removeChannel(channel);
     };
-  }, [supabase, fetchCameraStatus]);
+  }, [supabase]);
 
   const camOnline =
     supaConfigured && camLastSeen ? (nowTick - camLastSeen.getTime()) / 1000 < CAM_ONLINE_THRESHOLD_SEC : false;
 
-  // ------ Snapshot kamera (tanpa live stream) ------
+  // ------ Snapshot kamera (akses dari mana saja, tanpa port forwarding/Tailscale) ------
   const [latestSnapshot, setLatestSnapshot] = useState(null); // { url, source, captured_at }
   const [snapshotHistory, setSnapshotHistory] = useState([]); // hasil filter saat ini, terbaru dulu
   const [snapshotWaiting, setSnapshotWaiting] = useState(false);
   const [snapshotTimedOut, setSnapshotTimedOut] = useState(false);
   const [snapshotViewing, setSnapshotViewing] = useState(null); // snapshot yang lagi dilihat gede
-  const [snapshotCommandError, setSnapshotCommandError] = useState("");
   const snapshotRequestedAtRef = useRef(null);
-  const snapshotBaselineCapturedAtRef = useRef(null);
 
-  const SNAPSHOT_HISTORY_LIMIT = 16;
-  const SNAPSHOT_TIMEOUT_MS = 45000;
-  const SNAPSHOT_POLL_MS = 1500;
+  const SNAPSHOT_HISTORY_LIMIT = 16; // dipakai kalau filter = "latest" (tanpa rentang tanggal)
 
   // filter riwayat: "latest" (16 terakhir) | "1"/"3"/"7" (n hari terakhir) | "date" (tanggal tertentu)
   const [snapshotFilterMode, setSnapshotFilterMode] = useState("latest");
@@ -1002,11 +836,7 @@ export default function App() {
       query = query.limit(SNAPSHOT_HISTORY_LIMIT);
     }
 
-    const { data, error } = await query;
-    if (error) {
-      console.error("Gagal membaca riwayat snapshot:", error);
-      return;
-    }
+    const { data } = await query;
     setSnapshotHistory(data || []);
   }, [supabase, snapshotFilterMode, snapshotFilterDate]);
 
@@ -1014,55 +844,17 @@ export default function App() {
     fetchSnapshotHistory();
   }, [fetchSnapshotHistory]);
 
-  const isSnapshotForCurrentRequest = useCallback((snapshot) => {
-    if (!snapshot || snapshot.source !== "manual") return false;
-
-    const capturedAt = new Date(snapshot.captured_at).getTime();
-    if (!Number.isFinite(capturedAt)) return false;
-
-    const requestedAt = snapshotRequestedAtRef.current;
-    if (requestedAt) {
-      const requestedMs = new Date(requestedAt).getTime();
-      if (Number.isFinite(requestedMs) && capturedAt < requestedMs - 10000) return false;
-    }
-
-    // Baseline dibuat tepat sebelum command dikirim, jadi snapshot manual lama tidak dihitung.
-    const baseline = snapshotBaselineCapturedAtRef.current;
-    if (baseline) {
-      const baselineMs = new Date(baseline).getTime();
-      if (Number.isFinite(baselineMs) && capturedAt <= baselineMs) return false;
-    }
-
-    return true;
-  }, []);
-
-  const applyNewSnapshot = useCallback(
-    (snapshot) => {
-      if (!snapshot?.url || !snapshot?.captured_at) return;
-
-      setLatestSnapshot(snapshot);
-      if (snapshotInCurrentFilter(snapshot)) {
-        const cap = snapshotFilterMode === "latest" ? SNAPSHOT_HISTORY_LIMIT : 300;
-        setSnapshotHistory((h) => [snapshot, ...h].slice(0, cap));
-      }
-    },
-    [snapshotInCurrentFilter, snapshotFilterMode]
-  );
-
   useEffect(() => {
     if (!supabase) return;
 
+    // ambil foto TERBARU secara umum (independen dari filter), untuk tampilan utama
     supabase
       .from("camera_snapshots")
       .select("url,source,captured_at")
       .order("captured_at", { ascending: false })
       .limit(1)
       .maybeSingle()
-      .then(({ data, error }) => {
-        if (error) {
-          console.error("Gagal membaca snapshot terbaru:", error);
-          return;
-        }
+      .then(({ data }) => {
         if (data) setLatestSnapshot(data);
       });
 
@@ -1072,17 +864,12 @@ export default function App() {
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "camera_snapshots" },
         (payload) => {
-          const snapshot = payload.new;
-          applyNewSnapshot(snapshot);
-
-          // Realtime adalah jalur cepat. Polling di bawah tetap menjadi fallback kalau Realtime gagal.
-          if (snapshotWaiting && isSnapshotForCurrentRequest(snapshot)) {
-            setSnapshotWaiting(false);
-            setSnapshotTimedOut(false);
-            setSnapshotCommandError("");
-            snapshotRequestedAtRef.current = null;
-            snapshotBaselineCapturedAtRef.current = null;
+          setLatestSnapshot(payload.new);
+          if (snapshotInCurrentFilter(payload.new)) {
+            const cap = snapshotFilterMode === "latest" ? SNAPSHOT_HISTORY_LIMIT : 300;
+            setSnapshotHistory((h) => [payload.new, ...h].slice(0, cap));
           }
+          setSnapshotWaiting(false);
         }
       )
       .subscribe();
@@ -1090,97 +877,33 @@ export default function App() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [supabase, applyNewSnapshot, snapshotWaiting, isSnapshotForCurrentRequest]);
+  }, [supabase, snapshotInCurrentFilter, snapshotFilterMode]);
+
+  const [snapshotCommandError, setSnapshotCommandError] = useState("");
 
   const handleCaptureNow = async () => {
-    if (!supabase || snapshotWaiting) return;
-
+    if (!supabase) return;
+    const requestTime = new Date().toISOString();
+    snapshotRequestedAtRef.current = requestTime;
     setSnapshotWaiting(true);
     setSnapshotTimedOut(false);
     setSnapshotCommandError("");
-
-    try {
-      // Ambil snapshot terakhir sebelum command sebagai baseline.
-      // Ini membuat polling tidak salah menganggap foto manual lama sebagai hasil klik sekarang.
-      const { data: baseline, error: baselineError } = await supabase
-        .from("camera_snapshots")
-        .select("captured_at")
-        .order("captured_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (baselineError) throw baselineError;
-      snapshotBaselineCapturedAtRef.current = baseline?.captured_at || null;
-
-      const requestTime = new Date().toISOString();
-      snapshotRequestedAtRef.current = requestTime;
-
-      const { error } = await supabase
-        .from("camera_command")
-        .upsert({ id: 1, capture_requested_at: requestTime });
-
-      if (error) throw error;
-    } catch (err) {
-      console.error("Gagal mengirim perintah capture:", err);
+    const { error } = await supabase.from("camera_command").upsert({ id: 1, capture_requested_at: requestTime });
+    if (error) {
+      console.error("Gagal kirim perintah capture:", error);
       setSnapshotWaiting(false);
-      setSnapshotCommandError(err?.message || "Gagal mengirim perintah ke Supabase");
-      snapshotRequestedAtRef.current = null;
-      snapshotBaselineCapturedAtRef.current = null;
+      setSnapshotCommandError(error.message || "Gagal mengirim perintah ke Supabase");
     }
   };
 
-  // Polling adalah fallback utama jika Supabase Realtime tidak mengirim event INSERT ke browser.
   useEffect(() => {
-    if (!snapshotWaiting || !supabase) return;
-
-    let cancelled = false;
-    let timer = null;
-    const startedAt = Date.now();
-
-    const poll = async () => {
-      if (cancelled) return;
-
-      const { data, error } = await supabase
-        .from("camera_snapshots")
-        .select("url,source,captured_at")
-        .eq("source", "manual")
-        .order("captured_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (cancelled) return;
-
-      if (!error && data && isSnapshotForCurrentRequest(data)) {
-        applyNewSnapshot(data);
-        setSnapshotWaiting(false);
-        setSnapshotTimedOut(false);
-        setSnapshotCommandError("");
-        snapshotRequestedAtRef.current = null;
-        snapshotBaselineCapturedAtRef.current = null;
-        return;
-      }
-
-      if (Date.now() - startedAt >= SNAPSHOT_TIMEOUT_MS) {
-        setSnapshotWaiting(false);
-        setSnapshotTimedOut(true);
-        if (error) {
-          setSnapshotCommandError("Tidak bisa memverifikasi hasil capture dari Supabase.");
-        }
-        snapshotRequestedAtRef.current = null;
-        snapshotBaselineCapturedAtRef.current = null;
-        return;
-      }
-
-      timer = setTimeout(poll, SNAPSHOT_POLL_MS);
-    };
-
-    poll();
-
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [snapshotWaiting, supabase, isSnapshotForCurrentRequest, applyNewSnapshot]);
+    if (!snapshotWaiting) return;
+    const id = setTimeout(() => {
+      setSnapshotWaiting(false);
+      setSnapshotTimedOut(true);
+    }, 60000); // 1 menit — kalau ESP32-CAM offline/gak sempat polling, jangan stuck loading terus
+    return () => clearTimeout(id);
+  }, [snapshotWaiting]);
 
   // simulasi data real-time (dipakai saat Supabase belum dikonfigurasi)
   useEffect(() => {
@@ -1302,44 +1025,30 @@ export default function App() {
     };
   }, [supabase, fanMode, fanManualOn]);
 
-  // Mode kipas tetap tersinkron otomatis ke box_settings.
-  // Threshold TIDAK lagi autosave: threshold hanya berubah permanen setelah tombol Save ditekan.
+  // kirim threshold & mode kipas ke tabel box_settings, supaya ESP32 bisa membacanya
+  // dan menjalankan kipas secara lokal (tidak bergantung pada koneksi internet saat itu juga)
   useEffect(() => {
-    if (!supabase || !settingsLoaded) return;
-
+    if (!supabase) return;
     const id = setTimeout(() => {
       supabase
         .from("box_settings")
-        .upsert(
-          {
-            id: 1,
-            suhumin: thresholds.suhuMin,
-            suhumax: thresholds.suhuMax,
-            lembapmin: thresholds.lembapMin,
-            lembapmax: thresholds.lembapMax,
-            vocmin: thresholds.vocMin,
-            vocmax: thresholds.vocMax,
-            busuk_vocmin: busukThresholds.vocMin,
-            busuk_vocmax: busukThresholds.vocMax,
-            busuk_suhumin: busukThresholds.suhuMin,
-            busuk_suhumax: busukThresholds.suhuMax,
-            busuk_lembapmin: busukThresholds.lembapMin,
-            busuk_lembapmax: busukThresholds.lembapMax,
-            fan_mode: fanMode,
-            fan_manual_on: fanManualOn,
-          },
-          { onConflict: "id" }
-        )
+        .upsert({
+          id: 1,
+          suhumin: thresholds.suhuMin,
+          suhumax: thresholds.suhuMax,
+          lembapmin: thresholds.lembapMin,
+          lembapmax: thresholds.lembapMax,
+          vocmin: thresholds.vocMin,
+          vocmax: thresholds.vocMax,
+          fan_mode: fanMode,
+          fan_manual_on: fanManualOn,
+        })
         .then(({ error }) => {
-          if (error) {
-            console.error("Gagal sinkron mode kipas:", error);
-            setSupaStatus("error");
-          }
+          if (error) setSupaStatus("error");
         });
-    }, 300);
-
+    }, 500);
     return () => clearTimeout(id);
-  }, [supabase, settingsLoaded, thresholds, busukThresholds, fanMode, fanManualOn]);
+  }, [supabase, thresholds, fanMode, fanManualOn]);
 
   // rekomendasi AI mengikuti data & threshold
   useEffect(() => {
@@ -1379,11 +1088,19 @@ export default function App() {
     ? supaStatus !== "error" && secondsSinceUpdate !== null && secondsSinceUpdate < 30
     : true;
 
-  // Slider rentang ideal hanya mengubah draft. Nilai aktif berubah setelah Save berhasil.
-  const setThreshold = (patch) => setThresholdDraft((t) => ({ ...t, ...patch }));
+  const setThreshold = (patch) => setThresholds((t) => ({ ...t, ...patch }));
 
   // ------ Deteksi kebusukan buah (VOC = indikator utama, suhu & kelembapan = faktor pemicu) ------
-  // Pakai rentang aman yang SUDAH TERSIMPAN (busukThresholds), bukan draft.
+  // Pakai rentang aman (min-max) per parameter — di luar rentang = jadi faktor risiko.
+  const [busukThresholds, setBusukThresholds] = useState({
+    vocMin: 0,
+    vocMax: 500,
+    suhuMin: 15,
+    suhuMax: 30,
+    lembapMin: 50,
+    lembapMax: 85,
+  });
+
   const BUSUK_COLOR = { ideal: "#6ee7b7", waspada: "#facc15", tinggi: "#fb7185" };
 
   const busukStatus = useMemo(() => {
@@ -1441,11 +1158,11 @@ export default function App() {
     if (supaConfigured && !deviceOnline) {
       list.push({ key: "device-offline", text: "ESP32 (sensor + kipas) offline — tidak ada data baru." });
     }
-    if (supaConfigured && camPowerOn && camLastSeen && !camOnline) {
-      list.push({ key: "cam-offline", text: "ESP32-CAM offline — daya sudah ON tetapi heartbeat terakhir terlalu lama." });
+    if (supaConfigured && camLastSeen && !camOnline) {
+      list.push({ key: "cam-offline", text: "ESP32-CAM offline — heartbeat terakhir terlalu lama." });
     }
     return list;
-  }, [busukStatus, supaConfigured, deviceOnline, camPowerOn, camOnline, camLastSeen]);
+  }, [busukStatus, supaConfigured, deviceOnline, camOnline, camLastSeen]);
 
   // notifikasi browser (opsional) — sekali per kejadian, bukan tiap render
   const [notifEnabled, setNotifEnabled] = useState(false);
@@ -1649,6 +1366,68 @@ export default function App() {
           ))}
         </div>
       )}
+
+      {/* unduh data */}
+      <div className="mx-auto max-w-[1360px] px-6 mt-5">
+        <Glass>
+          <SectionTitle icon={Download} title="Unduh data" sub="Sensor & foto kamera — pilih rentang tanggal" />
+          <div className="px-6 pt-3 flex flex-wrap items-center gap-2.5">
+            <input
+              type="date"
+              value={downloadStart}
+              max={downloadEnd}
+              onChange={(e) => setDownloadStart(e.target.value)}
+              className="px-3 py-1.5 rounded-full text-[12.5px] bg-white/5 border border-white/10 text-white/70 outline-none focus:border-cyan-300/40"
+              style={{ colorScheme: "dark" }}
+            />
+            <span className="text-white/30 text-[12.5px]">sampai</span>
+            <input
+              type="date"
+              value={downloadEnd}
+              min={downloadStart}
+              max={dateStr(new Date())}
+              onChange={(e) => setDownloadEnd(e.target.value)}
+              className="px-3 py-1.5 rounded-full text-[12.5px] bg-white/5 border border-white/10 text-white/70 outline-none focus:border-cyan-300/40"
+              style={{ colorScheme: "dark" }}
+            />
+          </div>
+          <div className="px-6 pb-6 pt-3 grid sm:grid-cols-2 gap-3">
+            <button
+              onClick={handleDownloadSensorCSV}
+              disabled={!supaConfigured || downloadingSensor}
+              className="flex items-center gap-3 rounded-2xl bg-white/[0.04] border border-white/[0.06] px-4 py-3.5 hover:bg-white/[0.07] transition-colors disabled:opacity-40 disabled:cursor-not-allowed text-left"
+            >
+              <div className="h-9 w-9 rounded-xl bg-cyan-300/15 border border-cyan-300/25 flex items-center justify-center shrink-0">
+                <FileDown size={16} className="text-cyan-200" />
+              </div>
+              <div>
+                <div className="text-[13.5px] text-white/85 font-medium">
+                  {downloadingSensor ? "Menyiapkan…" : "Unduh data sensor (CSV)"}
+                </div>
+                <div className="text-[12px] text-white/40 mt-0.5">Suhu, kelembapan, VOC, sinyal, tegangan panel</div>
+              </div>
+            </button>
+
+            <button
+              onClick={handleDownloadPhotosZip}
+              disabled={!supaConfigured || downloadingPhotos}
+              className="flex items-center gap-3 rounded-2xl bg-white/[0.04] border border-white/[0.06] px-4 py-3.5 hover:bg-white/[0.07] transition-colors disabled:opacity-40 disabled:cursor-not-allowed text-left"
+            >
+              <div className="h-9 w-9 rounded-xl bg-amber-300/15 border border-amber-300/25 flex items-center justify-center shrink-0">
+                <Archive size={16} className="text-amber-200" />
+              </div>
+              <div>
+                <div className="text-[13.5px] text-white/85 font-medium">
+                  {downloadingPhotos ? "Mengunduh…" : "Unduh foto kamera (ZIP)"}
+                </div>
+                <div className="text-[12px] text-white/40 mt-0.5">
+                  {photoDownloadProgress || "Semua snapshot interval & manual"}
+                </div>
+              </div>
+            </button>
+          </div>
+        </Glass>
+      </div>
 
       {/* status sistem */}
       <div className="mx-auto max-w-[1360px] px-6 mt-5 grid grid-cols-1 sm:grid-cols-3 gap-5">
@@ -1885,17 +1664,7 @@ export default function App() {
           <SectionTitle
             icon={ShieldAlert}
             title="Deteksi kebusukan buah"
-            sub={settingsLoading ? "Memuat pengaturan..." : "Gabungan VOC, suhu & kelembapan"}
-            action={
-              <button
-                onClick={() => setBusukDraft({ ...DEFAULT_BUSUK_THRESHOLDS })}
-                className="h-8 px-3 rounded-full border border-white/10 bg-white/5 flex items-center gap-1.5 text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors text-[12px]"
-                title="Kembalikan ke rentang default"
-              >
-                <RefreshCw size={13} />
-                Reset
-              </button>
-            }
+            sub="Gabungan VOC, suhu & kelembapan"
           />
           <div className="px-6 pb-6 pt-3">
             <div
@@ -1922,17 +1691,17 @@ export default function App() {
                     Rentang VOC aman
                   </span>
                   <span className="text-[12.5px] text-white/45 tabular">
-                    {busukDraft.vocMin} – {busukDraft.vocMax} ppm
+                    {busukThresholds.vocMin} – {busukThresholds.vocMax} ppm
                   </span>
                 </div>
                 <DualRange
                   boundsMin={0}
                   boundsMax={1000}
-                  min={busukDraft.vocMin}
-                  max={busukDraft.vocMax}
+                  min={busukThresholds.vocMin}
+                  max={busukThresholds.vocMax}
                   color="#b79cff"
                   step={10}
-                  onChange={(newMin, newMax) => setBusukDraft((t) => ({ ...t, vocMin: newMin, vocMax: newMax }))}
+                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, vocMin: newMin, vocMax: newMax }))}
                 />
               </div>
 
@@ -1943,17 +1712,17 @@ export default function App() {
                     Rentang suhu aman
                   </span>
                   <span className="text-[12.5px] text-white/45 tabular">
-                    {busukDraft.suhuMin} – {busukDraft.suhuMax} °C
+                    {busukThresholds.suhuMin} – {busukThresholds.suhuMax} °C
                   </span>
                 </div>
                 <DualRange
                   boundsMin={10}
                   boundsMax={45}
-                  min={busukDraft.suhuMin}
-                  max={busukDraft.suhuMax}
+                  min={busukThresholds.suhuMin}
+                  max={busukThresholds.suhuMax}
                   color="#ff9466"
                   step={1}
-                  onChange={(newMin, newMax) => setBusukDraft((t) => ({ ...t, suhuMin: newMin, suhuMax: newMax }))}
+                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, suhuMin: newMin, suhuMax: newMax }))}
                 />
               </div>
 
@@ -1964,69 +1733,25 @@ export default function App() {
                     Rentang kelembapan aman
                   </span>
                   <span className="text-[12.5px] text-white/45 tabular">
-                    {busukDraft.lembapMin} – {busukDraft.lembapMax} %
+                    {busukThresholds.lembapMin} – {busukThresholds.lembapMax} %
                   </span>
                 </div>
                 <DualRange
                   boundsMin={20}
                   boundsMax={95}
-                  min={busukDraft.lembapMin}
-                  max={busukDraft.lembapMax}
+                  min={busukThresholds.lembapMin}
+                  max={busukThresholds.lembapMax}
                   color="#5ec8d8"
                   step={1}
-                  onChange={(newMin, newMax) => setBusukDraft((t) => ({ ...t, lembapMin: newMin, lembapMax: newMax }))}
+                  onChange={(newMin, newMax) => setBusukThresholds((t) => ({ ...t, lembapMin: newMin, lembapMax: newMax }))}
                 />
               </div>
-
-              <div className="flex items-center gap-1.5 text-[11.5px] text-white/35 pt-1">
-                <ChevronRight size={13} />
-                {busukDirty ? "Ada perubahan yang belum disimpan" : "Pengaturan sudah tersimpan"}
-              </div>
-
-              <button
-                onClick={saveBusukSettings}
-                disabled={!supabase || !settingsLoaded || settingsLoading || !busukDirty || busukSaveStatus === "saving"}
-                className="w-full h-11 rounded-xl border flex items-center justify-center gap-2 text-[13px] font-medium transition-all disabled:cursor-not-allowed"
-                style={{
-                  background: busukDirty ? "rgba(110,231,183,0.12)" : "rgba(255,255,255,0.04)",
-                  borderColor: busukDirty ? "rgba(110,231,183,0.32)" : "rgba(255,255,255,0.08)",
-                  color: busukDirty ? "#6ee7b7" : "rgba(255,255,255,0.35)",
-                  opacity: busukSaveStatus === "saving" ? 0.75 : 1,
-                }}
-              >
-                {busukSaveStatus === "saving" ? (
-                  <>
-                    <RefreshCw size={15} className="animate-spin" /> Menyimpan...
-                  </>
-                ) : busukSaveStatus === "success" ? (
-                  <>
-                    <CheckCircle2 size={15} /> Tersimpan
-                  </>
-                ) : busukDirty ? (
-                  <>
-                    <UploadCloud size={15} /> Simpan pengaturan
-                  </>
-                ) : (
-                  <>
-                    <CheckCircle2 size={15} /> Tersimpan
-                  </>
-                )}
-              </button>
-
-              {busukSaveStatus === "error" && settingsError && (
-                <div className="flex items-start gap-1.5 text-[11.5px] text-rose-300">
-                  <AlertCircle size={13} className="mt-0.5 shrink-0" />
-                  <span>{settingsError}</span>
-                </div>
-              )}
             </div>
 
             <p className="text-[11.5px] text-white/30 mt-4 leading-relaxed">
               VOC adalah indikator utama gas hasil pembusukan. Suhu dan kelembapan di luar rentang aman
               jadi faktor yang mempercepat proses itu — status "Mulai Busuk" muncul kalau suhu atau
               kelembapan keluar dari rentangnya, dan "Busuk" kalau VOC melewati batas atas rentangnya.
-              Geser slider lalu tekan <span className="text-white/45">Simpan pengaturan</span> agar nilai
-              tersimpan di Supabase dan tetap sama saat dashboard dibuka di perangkat lain.
             </p>
           </div>
         </Glass>
@@ -2100,10 +1825,10 @@ export default function App() {
           <SectionTitle
             icon={Settings2}
             title="Rentang ideal"
-            sub={settingsLoading ? "Memuat pengaturan..." : "Atur ambang tiap sensor"}
+            sub="Atur ambang tiap sensor"
             action={
               <button
-                onClick={() => setThresholdDraft({ ...DEFAULT_THRESHOLDS })}
+                onClick={() => setThresholds(DEFAULT_THRESHOLDS)}
                 className="h-8 px-3 rounded-full border border-white/10 bg-white/5 flex items-center gap-1.5 text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors text-[12px]"
                 title="Kembalikan ke rentang default"
               >
@@ -2114,8 +1839,8 @@ export default function App() {
           />
           <div className="px-6 pb-6 pt-3 flex flex-col gap-6">
             {Object.values(METRICS).map((m) => {
-              const min = thresholdDraft[`${m.key}Min`];
-              const max = thresholdDraft[`${m.key}Max`];
+              const min = thresholds[`${m.key}Min`];
+              const max = thresholds[`${m.key}Max`];
               return (
                 <div key={m.key}>
                   <div className="flex items-center justify-between mb-2.5">
@@ -2141,61 +1866,9 @@ export default function App() {
                 </div>
               );
             })}
-
-            <div className="flex items-center gap-1.5 text-[11.5px] text-white/35 pt-1">
+            <div className="flex items-center gap-1.5 text-[11.5px] text-white/30 pt-1">
               <ChevronRight size={13} />
-              {idealDirty ? "Ada perubahan yang belum disimpan" : "Pengaturan sudah tersimpan"}
-            </div>
-
-            <button
-              onClick={saveIdealSettings}
-              disabled={!supabase || !settingsLoaded || settingsLoading || !idealDirty || idealSaveStatus === "saving"}
-              className="w-full h-11 rounded-xl border flex items-center justify-center gap-2 text-[13px] font-medium transition-all disabled:cursor-not-allowed"
-              style={{
-                background: idealDirty ? "rgba(110,231,183,0.12)" : "rgba(255,255,255,0.04)",
-                borderColor: idealDirty ? "rgba(110,231,183,0.32)" : "rgba(255,255,255,0.08)",
-                color: idealDirty ? "#6ee7b7" : "rgba(255,255,255,0.35)",
-                opacity: idealSaveStatus === "saving" ? 0.75 : 1,
-              }}
-            >
-              {idealSaveStatus === "saving" ? (
-                <>
-                  <RefreshCw size={15} className="animate-spin" /> Menyimpan...
-                </>
-              ) : idealSaveStatus === "success" ? (
-                <>
-                  <CheckCircle2 size={15} /> Tersimpan
-                </>
-              ) : idealDirty ? (
-                <>
-                  <UploadCloud size={15} /> Simpan pengaturan
-                </>
-              ) : (
-                <>
-                  <CheckCircle2 size={15} /> Tersimpan
-                </>
-              )}
-            </button>
-
-            {idealSaveStatus === "error" && settingsError && (
-              <div className="flex items-start gap-1.5 text-[11.5px] text-rose-300">
-                <AlertCircle size={13} className="mt-0.5 shrink-0" />
-                <span>{settingsError}</span>
-              </div>
-            )}
-
-            {!supabase && (
-              <p className="text-[11.5px] text-amber-300/60 leading-relaxed">
-                Hubungkan Supabase untuk menyimpan pengaturan secara permanen.
-              </p>
-            )}
-
-            <div className="flex items-start gap-1.5 text-[11.5px] text-white/30 pt-1 leading-relaxed">
-              <ChevronRight size={13} className="mt-0.5 shrink-0" />
-              <span>
-                Geser slider lalu tekan <span className="text-white/45">Simpan pengaturan</span>. Setelah berhasil,
-                nilai dipakai oleh logika kipas/grafik dan otomatis dimuat lagi saat FreshRay dibuka dari perangkat lain.
-              </span>
+              Perubahan diterapkan langsung ke logika kipas dan grafik
             </div>
           </div>
         </Glass>
@@ -2272,49 +1945,25 @@ export default function App() {
           <SectionTitle
             icon={Camera}
             title="Snapshot kamera"
-            sub="Foto berkala tiap 30 menit — live stream dinonaktifkan agar capture lebih stabil"
+            sub="Foto berkala tiap 30 menit — bisa diakses dari mana saja, tanpa port forwarding"
             action={
-              <div className="flex items-center gap-2 flex-wrap justify-end">
-                <button
-                  onClick={handleCamPowerToggle}
-                  disabled={!supaConfigured || !settingsLoaded || settingsLoading || camPowerSaving}
-                  className="h-8 px-3 rounded-full border flex items-center gap-1.5 text-[12px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                  style={{
-                    color: camPowerOn ? "#fb7185" : "#6ee7b7",
-                    borderColor: camPowerOn ? "rgba(251,113,133,0.3)" : "rgba(110,231,183,0.3)",
-                    background: camPowerOn ? "rgba(251,113,133,0.1)" : "rgba(110,231,183,0.1)",
-                  }}
-                  title={camPowerOn ? "Matikan daya ESP32-CAM" : "Nyalakan daya ESP32-CAM"}
-                >
-                  <Power size={13} />
-                  {camPowerSaving ? "Mengirim…" : camPowerOn ? "Matikan CAM" : "Nyalakan CAM"}
-                </button>
-
+              <div className="flex items-center gap-2">
                 <div
                   className="flex items-center gap-1.5 rounded-full px-2.5 py-1 border text-[11.5px]"
                   style={{
-                    color: !camPowerOn ? "rgba(255,255,255,0.45)" : camOnline ? "#6ee7b7" : "#fb7185",
-                    borderColor: !camPowerOn
-                      ? "rgba(255,255,255,0.12)"
-                      : camOnline
-                      ? "rgba(110,231,183,0.25)"
-                      : "rgba(251,113,133,0.25)",
-                    background: !camPowerOn
-                      ? "rgba(255,255,255,0.05)"
-                      : camOnline
-                      ? "rgba(110,231,183,0.08)"
-                      : "rgba(251,113,133,0.08)",
+                    color: camOnline ? "#6ee7b7" : "#fb7185",
+                    borderColor: camOnline ? "rgba(110,231,183,0.25)" : "rgba(251,113,133,0.25)",
+                    background: camOnline ? "rgba(110,231,183,0.08)" : "rgba(251,113,133,0.08)",
                   }}
                   title={camLastSeen ? `Heartbeat terakhir ${formatClock(camLastSeen)}` : "Belum ada heartbeat"}
                 >
-                  <span className={`h-1.5 w-1.5 rounded-full bg-current ${camPowerOn ? "animate-pulse" : ""}`} />
-                  ESP32-CAM {!camPowerOn ? "dimatikan" : camOnline ? "online" : "booting / offline"}
+                  <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" />
+                  ESP32-CAM {camOnline ? "online" : "offline"}
                   {camOnline && camRssi != null && ` · ${camRssi} dBm`}
                 </div>
-
                 <button
                   onClick={handleCaptureNow}
-                  disabled={!supaConfigured || !camPowerOn || !camOnline || snapshotWaiting}
+                  disabled={!supaConfigured || snapshotWaiting}
                   className="h-8 px-3 rounded-full border border-cyan-300/25 bg-cyan-300/15 flex items-center gap-1.5 text-cyan-200 hover:bg-cyan-300/25 transition-colors text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <RotateCw size={13} className={snapshotWaiting ? "animate-spin" : ""} />
@@ -2324,13 +1973,6 @@ export default function App() {
             }
           />
           <div className="px-6 pb-6 pt-3">
-            {camPowerError && (
-              <div className="mb-3 flex items-center gap-1.5 text-[12px] text-rose-300">
-                <AlertCircle size={13} />
-                {camPowerError}
-              </div>
-            )}
-
             <div className="aspect-video rounded-2xl bg-black/40 border border-white/10 overflow-hidden flex items-center justify-center">
               {snapshotViewing || latestSnapshot ? (
                 <img
@@ -2430,13 +2072,10 @@ export default function App() {
             ) : null}
 
             <p className="text-[11.5px] text-white/30 mt-2.5 leading-relaxed">
-              Tombol "Nyalakan CAM" / "Matikan CAM" mengubah GPIO14 di ESP32 utama lewat Supabase;
-              karena ESP32 utama mengambil box_settings tiap 10 detik, perubahan daya bisa butuh beberapa detik.
-              Setelah ESP32-CAM boot dan heartbeat masuk, status akan berubah menjadi online. ESP32-CAM ambil
-              foto otomatis tiap 30 menit dan upload ke Supabase — jalan lewat internet biasa, tidak butuh port
-              forwarding, Tailscale, atau berada di jaringan yang sama. Tombol "Ambil sekarang" minta ESP32-CAM
-              memotret di luar jadwal itu. Klik salah satu thumbnail di bawah untuk lihat riwayat
-              {SNAPSHOT_HISTORY_LIMIT} foto terakhir.
+              ESP32-CAM ambil foto otomatis tiap 30 menit dan upload ke Supabase — jalan lewat internet
+              biasa, tidak butuh port forwarding, Tailscale, atau berada di jaringan yang sama. Tombol
+              "Ambil sekarang" minta ESP32-CAM memotret di luar jadwal itu. Klik salah satu thumbnail di
+              bawah untuk lihat riwayat {SNAPSHOT_HISTORY_LIMIT} foto terakhir.
             </p>
           </div>
         </Glass>
