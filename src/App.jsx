@@ -1282,8 +1282,8 @@ export default function App() {
         <Glass className="px-6 py-4">
           <div className="flex items-center justify-between flex-wrap gap-4">
             <div className="flex items-center gap-3">
-              <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-cyan-300/40 to-violet-400/40 border border-white/15 flex items-center justify-center">
-                <Sparkles size={16} className="text-white/85" />
+              <div className="h-11 w-11 rounded-2xl bg-gradient-to-br from-cyan-300/20 to-violet-400/20 border border-white/15 flex items-center justify-center overflow-hidden shrink-0">
+                <img src="/logo.png" alt="Logo FIT" className="h-full w-full object-cover" />
               </div>
               <div>
                 <div className="text-[16px] font-semibold tracking-tight" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>
