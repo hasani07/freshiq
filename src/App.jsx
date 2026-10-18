@@ -1652,7 +1652,7 @@ export default function App() {
                 <div className="text-[13.5px] text-white/85 font-medium">
                   {downloadingSensor ? "Menyiapkan…" : "Unduh data sensor (CSV)"}
                 </div>
-                <div className="text-[12px] text-white/40 mt-0.5">Suhu, kelembapan, VOC, sinyal, tegangan panel</div>
+                <div className="text-[12px] text-white/40 mt-0.5">Suhu, kelembapan, VOC, dan sinyal WiFi</div>
               </div>
             </button>
 
@@ -2210,33 +2210,6 @@ export default function App() {
                 )}
               </>
             )}
-          </div>
-        </Glass>
-      </div>
-
-      {/* panel surya */}
-      <div className="mx-auto max-w-[1360px] px-6 mt-5">
-        <Glass>
-          <SectionTitle icon={Sun} title="Panel surya" sub="Tegangan hasil voltage divider di ESP32" />
-          <div className="px-6 pb-6 pt-3">
-            <div className="flex items-center gap-3">
-              <div
-                className="h-12 w-12 rounded-2xl flex items-center justify-center border shrink-0"
-                style={{ borderColor: `${PANEL_COLOR}40`, background: `${PANEL_COLOR}18` }}
-              >
-                <BatteryCharging size={20} style={{ color: PANEL_COLOR }} />
-              </div>
-              <div>
-                <div
-                  className="text-[30px] leading-none font-semibold tabular"
-                  style={{ fontFamily: "'Space Grotesk', sans-serif" }}
-                >
-                  {current.tegangan_panel != null ? current.tegangan_panel.toFixed(1) : "-"}
-                  <span className="text-[15px] text-white/40 ml-1">V</span>
-                </div>
-              </div>
-            </div>
-
           </div>
         </Glass>
       </div>
