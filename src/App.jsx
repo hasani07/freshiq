@@ -14,6 +14,8 @@ import {
 import {
   Thermometer,
   Droplets,
+  Save,
+  History,
   Wind,
   Fan,
   Sparkles,
@@ -405,6 +407,9 @@ function buildInsights(current, thresholds, fanOn, fanMode, seedTick) {
 
 const HISTORY_LEN = 40;
 
+// perangkat dianggap OFFLINE kalau tidak ada data/heartbeat masuk selama 2 menit
+const OFFLINE_AFTER_SEC = 120;
+
 const DEFAULT_THRESHOLDS = {
   suhuMin: 22,
   suhuMax: 30,
@@ -413,6 +418,72 @@ const DEFAULT_THRESHOLDS = {
   vocMin: 0,
   vocMax: 400,
 };
+
+// ---- Notifikasi push (Web Push) ----
+const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || "";
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+function detectPlatform() {
+  if (typeof navigator === "undefined") return { isIOS: false, isStandalone: false };
+  const ua = navigator.userAgent || "";
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isStandalone =
+    window.navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+  return { isIOS, isStandalone };
+}
+
+const DEFAULT_BUSUK = {
+  vocMin: 0,
+  vocMax: 500,
+  suhuMin: 15,
+  suhuMax: 30,
+  lembapMin: 50,
+  lembapMax: 85,
+};
+
+const RANGE_HISTORY_LIMIT = 5; // riwayat pengaturan: hanya 5 terakhir yang disimpan (sisanya dihapus trigger database)
+
+// ubah state (thresholds + busuk) <-> baris tabel range_settings / range_history
+function rangesToRow(th, bs) {
+  return {
+    suhumin: th.suhuMin, suhumax: th.suhuMax,
+    lembapmin: th.lembapMin, lembapmax: th.lembapMax,
+    vocmin: th.vocMin, vocmax: th.vocMax,
+    busuk_vocmin: bs.vocMin, busuk_vocmax: bs.vocMax,
+    busuk_suhumin: bs.suhuMin, busuk_suhumax: bs.suhuMax,
+    busuk_lembapmin: bs.lembapMin, busuk_lembapmax: bs.lembapMax,
+  };
+}
+
+function rowToRanges(r) {
+  return {
+    thresholds: {
+      suhuMin: r.suhumin, suhuMax: r.suhumax,
+      lembapMin: r.lembapmin, lembapMax: r.lembapmax,
+      vocMin: r.vocmin, vocMax: r.vocmax,
+    },
+    busuk: {
+      vocMin: r.busuk_vocmin, vocMax: r.busuk_vocmax,
+      suhuMin: r.busuk_suhumin, suhuMax: r.busuk_suhumax,
+      lembapMin: r.busuk_lembapmin, lembapMax: r.busuk_lembapmax,
+    },
+  };
+}
+
+function sameRanges(a, b) {
+  const ra = rangesToRow(a.thresholds, a.busuk);
+  const rb = rangesToRow(b.thresholds, b.busuk);
+  return Object.keys(ra).every((k) => Number(ra[k]) === Number(rb[k]));
+}
 
 export default function App() {
   const [now, setNow] = useState(new Date());
@@ -763,7 +834,7 @@ export default function App() {
   // ------ Status online/offline ESP32-CAM (heartbeat tiap 10 detik) ------
   const [camLastSeen, setCamLastSeen] = useState(null);
   const [camRssi, setCamRssi] = useState(null);
-  const CAM_ONLINE_THRESHOLD_SEC = 30; // heartbeat tiap 10 detik, kasih margin 3x lipat
+  const CAM_ONLINE_THRESHOLD_SEC = OFFLINE_AFTER_SEC; // dianggap offline kalau 2 menit tanpa heartbeat
 
   useEffect(() => {
     if (!supabase) return;
@@ -1036,30 +1107,21 @@ export default function App() {
     };
   }, [supabase, fanMode, fanManualOn]);
 
-  // kirim threshold & mode kipas ke tabel box_settings, supaya ESP32 bisa membacanya
-  // dan menjalankan kipas secara lokal (tidak bergantung pada koneksi internet saat itu juga)
+  // kirim mode kipas ke tabel box_settings supaya ESP32 bisa membacanya.
+  // Ambang (threshold) TIDAK ikut dikirim otomatis lagi — baru dikirim saat tombol Simpan ditekan,
+  // supaya perangkat lain yang baru membuka web tidak menimpa pengaturan dengan nilai default.
   useEffect(() => {
-    if (!supabase) return;
+    if (!supabase || !rangesLoaded) return;
     const id = setTimeout(() => {
       supabase
         .from("box_settings")
-        .upsert({
-          id: 1,
-          suhumin: thresholds.suhuMin,
-          suhumax: thresholds.suhuMax,
-          lembapmin: thresholds.lembapMin,
-          lembapmax: thresholds.lembapMax,
-          vocmin: thresholds.vocMin,
-          vocmax: thresholds.vocMax,
-          fan_mode: fanMode,
-          fan_manual_on: fanManualOn,
-        })
+        .upsert({ id: 1, fan_mode: fanMode, fan_manual_on: fanManualOn })
         .then(({ error }) => {
           if (error) setSupaStatus("error");
         });
     }, 500);
     return () => clearTimeout(id);
-  }, [supabase, thresholds, fanMode, fanManualOn]);
+  }, [supabase, rangesLoaded, fanMode, fanManualOn]);
 
   // rekomendasi AI mengikuti data & threshold
   useEffect(() => {
@@ -1094,23 +1156,106 @@ export default function App() {
   }, [supabase]);
 
   // status online/offline: demo selalu online (disimulasikan lokal),
-  // sedangkan mode Supabase dianggap offline kalau tidak ada data baru > 30 detik
+  // sedangkan mode Supabase dianggap offline kalau tidak ada data baru selama 2 menit
   const deviceOnline = supaConfigured
-    ? supaStatus !== "error" && secondsSinceUpdate !== null && secondsSinceUpdate < 30
+    ? supaStatus !== "error" && secondsSinceUpdate !== null && secondsSinceUpdate < OFFLINE_AFTER_SEC
     : true;
 
   const setThreshold = (patch) => setThresholds((t) => ({ ...t, ...patch }));
 
   // ------ Deteksi kebusukan buah (VOC = indikator utama, suhu & kelembapan = faktor pemicu) ------
   // Pakai rentang aman (min-max) per parameter — di luar rentang = jadi faktor risiko.
-  const [busukThresholds, setBusukThresholds] = useState({
-    vocMin: 0,
-    vocMax: 500,
-    suhuMin: 15,
-    suhuMax: 30,
-    lembapMin: 50,
-    lembapMax: 85,
-  });
+  const [busukThresholds, setBusukThresholds] = useState(DEFAULT_BUSUK);
+
+  // ------ Simpan rentang ideal + rentang kebusukan (tersinkron ke semua perangkat) ------
+  const [savedRanges, setSavedRanges] = useState(null); // { thresholds, busuk, updatedAt } — null = belum pernah disimpan
+  const [rangesLoaded, setRangesLoaded] = useState(false);
+  const [rangeHistory, setRangeHistory] = useState([]);
+  const [rangeSaving, setRangeSaving] = useState(false);
+  const [rangeMsg, setRangeMsg] = useState(null); // { ok: bool, text }
+
+  const rangesDirty = savedRanges
+    ? !sameRanges({ thresholds, busuk: busukThresholds }, savedRanges)
+    : rangesLoaded && !sameRanges({ thresholds, busuk: busukThresholds }, { thresholds: DEFAULT_THRESHOLDS, busuk: DEFAULT_BUSUK });
+
+  const loadRangeHistory = useCallback(async () => {
+    if (!supabase) return;
+    const { data } = await supabase
+      .from("range_history")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(RANGE_HISTORY_LIMIT);
+    if (data) setRangeHistory(data);
+  }, [supabase]);
+
+  // saat web dibuka (di perangkat mana pun): ambil rentang terakhir yang disimpan + status kipas
+  useEffect(() => {
+    if (!supabase) {
+      setRangesLoaded(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const [rangeRes, fanRes] = await Promise.all([
+        supabase.from("range_settings").select("*").eq("id", 1).maybeSingle(),
+        supabase.from("box_settings").select("fan_mode,fan_manual_on").eq("id", 1).maybeSingle(),
+      ]);
+      if (cancelled) return;
+      if (rangeRes.data) {
+        const r = rowToRanges(rangeRes.data);
+        setThresholds(r.thresholds);
+        setBusukThresholds(r.busuk);
+        setSavedRanges({ ...r, updatedAt: rangeRes.data.updated_at });
+      }
+      if (fanRes.data?.fan_mode) setFanMode(fanRes.data.fan_mode);
+      if (typeof fanRes.data?.fan_manual_on === "boolean") setFanManualOn(fanRes.data.fan_manual_on);
+      setRangesLoaded(true);
+      loadRangeHistory();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase, loadRangeHistory]);
+
+  const handleSaveRanges = async () => {
+    if (!supabase || rangeSaving) return;
+    setRangeSaving(true);
+    setRangeMsg(null);
+    const row = rangesToRow(thresholds, busukThresholds);
+    const nowIso = new Date().toISOString();
+
+    const [r1, r2, r3] = await Promise.all([
+      supabase.from("range_settings").upsert({ id: 1, ...row, updated_at: nowIso }),
+      supabase.from("range_history").insert(row),
+      // ambang kipas untuk ESP32 ikut diperbarui hanya saat Simpan ditekan
+      supabase.from("box_settings").upsert({
+        id: 1,
+        suhumin: thresholds.suhuMin,
+        suhumax: thresholds.suhuMax,
+        lembapmin: thresholds.lembapMin,
+        lembapmax: thresholds.lembapMax,
+        vocmin: thresholds.vocMin,
+        vocmax: thresholds.vocMax,
+      }),
+    ]);
+    setRangeSaving(false);
+
+    const err = r1.error || r2.error || r3.error;
+    if (err) {
+      setRangeMsg({ ok: false, text: `Gagal menyimpan: ${err.message}` });
+      return;
+    }
+    setSavedRanges({ thresholds: { ...thresholds }, busuk: { ...busukThresholds }, updatedAt: nowIso });
+    setRangeMsg({ ok: true, text: "Tersimpan — perangkat lain akan memakai rentang ini saat dibuka." });
+    loadRangeHistory();
+  };
+
+  const handleApplyHistory = (h) => {
+    const r = rowToRanges(h);
+    setThresholds(r.thresholds);
+    setBusukThresholds(r.busuk);
+    setRangeMsg({ ok: true, text: "Rentang dari riwayat dimuat — klik Simpan untuk menerapkannya." });
+  };
 
   const BUSUK_COLOR = { ideal: "#6ee7b7", waspada: "#facc15", tinggi: "#fb7185" };
 
@@ -1175,29 +1320,108 @@ export default function App() {
     return list;
   }, [busukStatus, supaConfigured, deviceOnline, camOnline, camLastSeen]);
 
-  // notifikasi browser (opsional) — sekali per kejadian, bukan tiap render
-  const [notifEnabled, setNotifEnabled] = useState(false);
-  const notifiedRef = useRef(new Set());
+  // ------ Notifikasi push (dikirim server lewat service worker, tetap masuk walau web ditutup) ------
+  // status: unsupported | needs-install (iOS belum "Add to Home Screen") | denied | off | on
+  const [pushStatus, setPushStatus] = useState("off");
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushMsg, setPushMsg] = useState(null); // { ok: bool, text }
+  const notifEnabled = pushStatus === "on";
 
+  // daftarkan service worker + cek apakah perangkat ini sudah berlangganan
   useEffect(() => {
-    if (!notifEnabled || typeof Notification === "undefined" || Notification.permission !== "granted") return;
-    alerts.forEach((a) => {
-      if (!notifiedRef.current.has(a.key)) {
-        notifiedRef.current.add(a.key);
-        new Notification("FreshRay", { body: a.text });
-      }
-    });
-    // hapus tanda kalau alert sudah tidak aktif lagi, biar bisa notif ulang kalau kejadian lagi nanti
-    const activeKeys = new Set(alerts.map((a) => a.key));
-    notifiedRef.current.forEach((k) => {
-      if (!activeKeys.has(k)) notifiedRef.current.delete(k);
-    });
-  }, [alerts, notifEnabled]);
+    const { isIOS, isStandalone } = detectPlatform();
+    const hasSW = "serviceWorker" in navigator;
+    const hasPush = hasSW && "PushManager" in window && "Notification" in window;
 
-  const handleEnableNotif = async () => {
-    if (typeof Notification === "undefined") return;
-    const perm = await Notification.requestPermission();
-    setNotifEnabled(perm === "granted");
+    if (!hasPush) {
+      setPushStatus(isIOS && !isStandalone ? "needs-install" : "unsupported");
+      if (hasSW) navigator.serviceWorker.register("/sw.js").catch(() => {});
+      return;
+    }
+    if (Notification.permission === "denied") setPushStatus("denied");
+
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then(() => navigator.serviceWorker.ready)
+      .then((reg) => reg.pushManager.getSubscription())
+      .then((sub) => {
+        if (sub && Notification.permission === "granted") setPushStatus("on");
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleToggleNotif = async () => {
+    if (pushBusy) return;
+    setPushMsg(null);
+
+    if (pushStatus === "needs-install") {
+      setPushMsg({
+        ok: false,
+        text:
+          "Di iPhone/iPad, notifikasi hanya bisa aktif kalau FreshRay dipasang ke Layar Utama dulu: buka lewat Safari → tombol Bagikan (kotak berpanah) → \"Tambahkan ke Layar Utama\" → buka FreshRay dari ikon barunya → tekan lonceng ini lagi. Butuh iOS 16.4 atau lebih baru.",
+      });
+      return;
+    }
+    if (pushStatus === "unsupported") {
+      setPushMsg({ ok: false, text: "Browser ini belum mendukung notifikasi push. Coba Chrome, Edge, Firefox, atau Safari versi terbaru." });
+      return;
+    }
+    if (pushStatus === "denied") {
+      setPushMsg({ ok: false, text: "Izin notifikasi diblokir untuk situs ini. Aktifkan lagi lewat pengaturan browser/iOS (Pengaturan → Notifikasi → FreshRay), lalu coba lagi." });
+      return;
+    }
+    if (!supabase) {
+      setPushMsg({ ok: false, text: "Hubungkan Supabase dulu supaya notifikasi bisa didaftarkan." });
+      return;
+    }
+    if (!VAPID_PUBLIC_KEY) {
+      setPushMsg({ ok: false, text: "Kunci notifikasi (VITE_VAPID_PUBLIC_KEY) belum dipasang di Vercel." });
+      return;
+    }
+
+    setPushBusy(true);
+    try {
+      const reg = await navigator.serviceWorker.ready;
+
+      if (pushStatus === "on") {
+        // matikan notifikasi di perangkat ini
+        const sub = await reg.pushManager.getSubscription();
+        if (sub) {
+          await supabase.from("push_subscriptions").delete().eq("endpoint", sub.endpoint);
+          await sub.unsubscribe();
+        }
+        setPushStatus("off");
+        setPushMsg({ ok: true, text: "Notifikasi dimatikan di perangkat ini." });
+        return;
+      }
+
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") {
+        setPushStatus(perm === "denied" ? "denied" : "off");
+        setPushMsg({ ok: false, text: "Izin notifikasi tidak diberikan." });
+        return;
+      }
+
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+      const json = sub.toJSON();
+      const { error } = await supabase
+        .from("push_subscriptions")
+        .upsert({ endpoint: json.endpoint, p256dh: json.keys.p256dh, auth: json.keys.auth }, { onConflict: "endpoint" });
+      if (error) throw error;
+
+      setPushStatus("on");
+      setPushMsg({ ok: true, text: "Notifikasi aktif — kamu akan dapat peringatan buah busuk atau perangkat offline, walau web ini ditutup." });
+    } catch (err) {
+      setPushMsg({ ok: false, text: `Gagal mengaktifkan notifikasi: ${err.message || err}` });
+    } finally {
+      setPushBusy(false);
+    }
   };
 
   return (
@@ -1313,9 +1537,11 @@ export default function App() {
                 </div>
               )}
               <button
-                onClick={handleEnableNotif}
-                className="h-8 w-8 rounded-full border border-white/10 bg-white/5 flex items-center justify-center text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors"
-                title={notifEnabled ? "Notifikasi browser aktif" : "Aktifkan notifikasi browser"}
+                onClick={handleToggleNotif}
+                disabled={pushBusy}
+                className="h-8 w-8 rounded-full border border-white/10 bg-white/5 flex items-center justify-center text-white/60 hover:text-white/90 hover:bg-white/10 transition-colors disabled:opacity-50"
+                style={notifEnabled ? { color: "#6ee7b7", borderColor: "rgba(110,231,183,0.3)", background: "rgba(110,231,183,0.1)" } : undefined}
+                title={notifEnabled ? "Notifikasi aktif (klik untuk matikan)" : "Aktifkan notifikasi"}
               >
                 {notifEnabled ? <Bell size={14} /> : <BellOff size={14} />}
               </button>
@@ -1332,6 +1558,17 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {pushMsg && (
+            <div className="mt-4 pt-4 border-t border-white/10 flex items-start justify-between gap-3">
+              <p className="text-[12.5px] leading-relaxed" style={{ color: pushMsg.ok ? "#6ee7b7" : "#fda4af" }}>
+                {pushMsg.text}
+              </p>
+              <button onClick={() => setPushMsg(null)} className="text-white/35 hover:text-white/70 text-[12px] shrink-0">
+                Tutup
+              </button>
+            </div>
+          )}
 
           {supaOpen && (
             <div className="mt-4 pt-4 border-t border-white/10 grid sm:grid-cols-[1fr_1fr_auto] gap-2.5">
@@ -1879,8 +2116,100 @@ export default function App() {
             })}
             <div className="flex items-center gap-1.5 text-[11.5px] text-white/30 pt-1">
               <ChevronRight size={13} />
-              Perubahan diterapkan langsung ke logika kipas dan grafik
+              Perubahan baru tersimpan & dipakai kipas ESP32 setelah klik Simpan (di panel bawah)
             </div>
+          </div>
+        </Glass>
+      </div>
+
+      {/* simpan rentang + riwayat */}
+      <div className="mx-auto max-w-[1360px] px-6 mt-5">
+        <Glass>
+          <SectionTitle
+            icon={Save}
+            title="Simpan rentang"
+            sub="Rentang ideal & rentang kebusukan — tersimpan untuk semua perangkat"
+            action={
+              <button
+                onClick={handleSaveRanges}
+                disabled={!supaConfigured || rangeSaving || !rangesDirty}
+                className="h-9 px-4 rounded-full border flex items-center gap-2 text-[13px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{
+                  borderColor: rangesDirty ? "rgba(110,231,183,0.45)" : "rgba(255,255,255,0.12)",
+                  background: rangesDirty ? "rgba(110,231,183,0.14)" : "rgba(255,255,255,0.05)",
+                  color: rangesDirty ? "#6ee7b7" : "rgba(255,255,255,0.6)",
+                }}
+              >
+                <Save size={14} />
+                {rangeSaving ? "Menyimpan..." : "Simpan"}
+              </button>
+            }
+          />
+          <div className="px-6 pb-6 pt-3">
+            {!supaConfigured ? (
+              <p className="text-[12.5px] text-white/40">Hubungkan Supabase dulu supaya rentang bisa disimpan dan dibagikan ke perangkat lain.</p>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 text-[12.5px] flex-wrap">
+                  <span
+                    className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 border text-[11.5px]"
+                    style={{
+                      color: rangesDirty ? "#facc15" : "#6ee7b7",
+                      borderColor: rangesDirty ? "rgba(250,204,21,0.3)" : "rgba(110,231,183,0.25)",
+                      background: rangesDirty ? "rgba(250,204,21,0.08)" : "rgba(110,231,183,0.08)",
+                    }}
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-current" />
+                    {rangesDirty ? "Ada perubahan belum disimpan" : "Sudah tersimpan"}
+                  </span>
+                  {savedRanges?.updatedAt && (
+                    <span className="text-white/35">
+                      Terakhir disimpan {new Date(savedRanges.updatedAt).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" })}
+                    </span>
+                  )}
+                </div>
+                {rangeMsg && (
+                  <p className="text-[12.5px] mt-2.5" style={{ color: rangeMsg.ok ? "#6ee7b7" : "#fb7185" }}>
+                    {rangeMsg.text}
+                  </p>
+                )}
+
+                <div className="mt-5 flex items-center gap-2 text-[13px] text-white/70">
+                  <History size={14} className="text-white/50" />
+                  Riwayat penyimpanan <span className="text-white/35">({RANGE_HISTORY_LIMIT} terakhir)</span>
+                </div>
+                {rangeHistory.length === 0 ? (
+                  <p className="text-[12.5px] text-white/35 mt-2">Belum ada riwayat — klik Simpan untuk membuat yang pertama.</p>
+                ) : (
+                  <div className="mt-2.5 flex flex-col gap-2">
+                    {rangeHistory.map((h, i) => (
+                      <div
+                        key={h.id}
+                        className="rounded-2xl bg-white/[0.04] border border-white/[0.06] px-4 py-3 flex items-center justify-between gap-3 flex-wrap"
+                      >
+                        <div className="min-w-0">
+                          <div className="text-[12.5px] text-white/75">
+                            {new Date(h.created_at).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" })}
+                            {i === 0 && <span className="ml-2 text-[11px] text-emerald-300/80">terbaru</span>}
+                          </div>
+                          <div className="text-[11.5px] text-white/40 mt-1 leading-relaxed">
+                            Ideal: suhu {h.suhumin}–{h.suhumax}°C · lembap {h.lembapmin}–{h.lembapmax}% · VOC {h.vocmin}–{h.vocmax} ppm
+                            <br />
+                            Kebusukan: VOC {h.busuk_vocmin}–{h.busuk_vocmax} ppm · suhu {h.busuk_suhumin}–{h.busuk_suhumax}°C · lembap {h.busuk_lembapmin}–{h.busuk_lembapmax}%
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => handleApplyHistory(h)}
+                          className="h-8 px-3 rounded-full border border-white/10 bg-white/5 text-white/65 hover:text-white/90 hover:bg-white/10 transition-colors text-[12px]"
+                        >
+                          Pakai lagi
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </Glass>
       </div>
@@ -1889,8 +2218,8 @@ export default function App() {
       <div className="mx-auto max-w-[1360px] px-6 mt-5">
         <Glass>
           <SectionTitle icon={Sun} title="Panel surya" sub="Tegangan hasil voltage divider di ESP32" />
-          <div className="px-6 pb-6 pt-3 grid md:grid-cols-[auto_1fr] gap-6 items-center">
-            <div className="flex items-center gap-3 md:pr-6 md:border-r border-white/10">
+          <div className="px-6 pb-6 pt-3">
+            <div className="flex items-center gap-3">
               <div
                 className="h-12 w-12 rounded-2xl flex items-center justify-center border shrink-0"
                 style={{ borderColor: `${PANEL_COLOR}40`, background: `${PANEL_COLOR}18` }}
@@ -1908,44 +2237,6 @@ export default function App() {
               </div>
             </div>
 
-            <div className="h-[140px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="fillPanel" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor={PANEL_COLOR} stopOpacity={0.4} />
-                      <stop offset="100%" stopColor={PANEL_COLOR} stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                  <XAxis dataKey="time" type="number" domain={["dataMin", "dataMax"]} scale="time" hide />
-                  <YAxis
-                    domain={PANEL_BOUNDS}
-                    tick={{ fill: "rgba(255,255,255,0.35)", fontSize: 11 }}
-                    axisLine={false}
-                    tickLine={false}
-                    width={30}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      background: "rgba(10,16,28,0.92)",
-                      border: "1px solid rgba(255,255,255,0.12)",
-                      borderRadius: 12,
-                      fontSize: 12.5,
-                    }}
-                    labelFormatter={(label) => formatClock(new Date(label))}
-                    formatter={(v) => [`${v?.toFixed ? v.toFixed(2) : v} V`, "Panel surya"]}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="tegangan_panel"
-                    stroke={PANEL_COLOR}
-                    strokeWidth={2.2}
-                    fill="url(#fillPanel)"
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
           </div>
         </Glass>
       </div>

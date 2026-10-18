@@ -27,14 +27,15 @@ A web dashboard for monitoring and controlling the environment inside a closed f
 
 **Monitoring**
 - Real-time temperature & humidity (DHT22) and VOC level (MS-1100), with trend charts that highlight the ideal range and auto-scale their Y-axis
-- Solar panel voltage (via a voltage divider) with its own trend chart — display-only, intentionally no threshold/alert on it
+- Solar panel voltage (via a voltage divider) — display-only, intentionally no threshold/alert and no chart
 - WiFi signal strength (RSSI) for each board
-- Online/offline status per device, last-seen timestamp
+- Online/offline status per device, last-seen timestamp — a device is marked **offline after 2 minutes** without incoming data
 
 **Control**
 - Fan: automatic mode (hysteresis against thresholds) or manual override
 - Adjustable temperature/humidity/VOC thresholds via dual-range sliders
 - **Fruit spoilage detection**: a Fresh / Starting to Spoil / Spoiled status computed from VOC, temperature and humidity together, with its own adjustable dual-range thresholds
+- **Save ranges**: ideal ranges and spoilage ranges are saved with a *Save* button, so every device that opens the dashboard sees the same values (not the defaults). The last 5 saves are kept as a history you can re-apply; older ones are deleted automatically
 
 **Camera (ESP32-CAM)**
 - Automatic snapshot every 30 minutes, plus an on-demand "Capture now" button
@@ -49,7 +50,7 @@ A web dashboard for monitoring and controlling the environment inside a closed f
 
 **Also included**
 - Rule-based recommendations comparing current readings against thresholds
-- Alert banners for "Spoiled" status and offline devices, with optional browser push notifications
+- Alert banners for "Spoiled" status and offline devices, plus **push notifications that work on iOS, Android and desktop** (even with the web page closed). On iPhone/iPad, add the site to the Home Screen first (iOS 16.4+)
 - Data export: CSV of sensor readings and a ZIP of camera photos, with a free date-range picker, human-readable filenames, and a manifest CSV inside the ZIP
 - Glassmorphism UI, responsive from mobile to desktop
 
@@ -71,14 +72,16 @@ A web dashboard for monitoring and controlling the environment inside a closed f
 │  Postgres                             Storage (public-read buckets) │
 │  ├─ sensor_readings (+rssi,           ├─ firmware/   (OTA .bin)     │
 │  │  tegangan_panel)                   └─ snapshots/  (camera photos)│
-│  ├─ box_settings (thresholds, fan)                                  │
+│  ├─ box_settings (fan mode + thresholds read by ESP32)              │
+│  ├─ range_settings / range_history (saved ranges, last 5)           │
+│  ├─ push_subscriptions / alert_state (push notifications)           │
 │  ├─ ota_firmware (version per device)  Edge Functions                │
 │  ├─ wifi_config (new SSID/password)    ├─ check-ota-pin              │
 │  ├─ wifi_history (log, capped 3/device)│    validates PIN server-side│
-│  ├─ device_logs (capped 50/device)     └─ cleanup-old-snapshots      │
-│  ├─ camera_snapshots                        deletes photos > 7 days  │
+│  ├─ device_logs (capped 50/device)     ├─ cleanup-old-snapshots      │
+│  ├─ camera_snapshots                   │    deletes photos > 7 days  │
 │  ├─ camera_command (manual-capture flag)    (scheduled via pg_cron)  │
-│  └─ camera_status (heartbeat + rssi)                                 │
+│  └─ camera_status (heartbeat + rssi)   └─ send-alerts (web push, 1/min)│
 │                                                                      │
 │  Realtime (postgres_changes, enabled per table via publication)     │
 └────────────────────────────┬─────────────────────────────────────────┘
@@ -99,6 +102,10 @@ A web dashboard for monitoring and controlling the environment inside a closed f
 **OTA flow**: the dashboard uploads a `.bin` file to the `firmware` bucket and registers the target version in `ota_firmware` — but only after the entered PIN passes the `check-ota-pin` Edge Function (the real PIN never ships in the JavaScript bundle). Each board polls this table, compares versions, and runs `HTTPUpdate` when a newer one is found.
 
 **WiFi flow**: the dashboard writes a new SSID/password to `wifi_config`. The board polls, attempts to connect to the new network, and — if it fails to connect within 15 seconds — automatically falls back to the previous network (old credentials stay persisted via `Preferences`/NVS). The outcome (success/fail) is logged to `wifi_history`, auto-trimmed to the last 3 entries per device by a Postgres trigger.
+
+**Save-ranges flow**: pressing *Save* writes the ideal + spoilage ranges to `range_settings` (what every device loads on open), appends a row to `range_history` (a Postgres trigger keeps only the newest 5), and updates `box_settings` so the ESP32 fan logic uses the new thresholds. Nothing is pushed to the database while sliders are merely being dragged, so a second device opening the dashboard can never overwrite saved values with defaults.
+
+**Notification flow**: tapping the bell registers a service worker (`public/sw.js`), asks for permission, and stores the device's Web Push subscription in `push_subscriptions`. Every minute `pg_cron` calls the `send-alerts` Edge Function, which checks for a newly spoiled reading or a device with no data for 2 minutes, and sends a push **once per event** (tracked in `alert_state`) to all subscribed devices — so alerts arrive even when no browser tab is open.
 
 **Log flow**: firmware has a `logRemote()` helper that does both a local `Serial.println` and a fire-and-forget `POST` to `device_logs`. The dashboard **does not** subscribe to this table in real time — it fetches only when you press "View log", to feel like opening a Serial Monitor on demand. Old rows are auto-trimmed to the last 50 per device by a trigger.
 
@@ -132,6 +139,7 @@ The OTA PIN gate is validated by the `check-ota-pin` Edge Function, not in the R
 4. Add Environment Variables under Project Settings → Environment Variables:
    - `VITE_SUPABASE_URL`
    - `VITE_SUPABASE_ANON_KEY`
+   - `VITE_VAPID_PUBLIC_KEY` (public key for push notifications)
 5. Deploy
 
 ### Firmware
@@ -168,14 +176,15 @@ Dashboard web untuk memantau dan mengendalikan kondisi lingkungan dalam sebuah b
 
 **Monitoring**
 - Suhu & kelembapan (DHT22) dan kadar VOC (MS-1100) real-time, dengan grafik tren yang menyorot rentang ideal dan auto-scaling sumbu Y
-- Tegangan panel surya (voltage divider) dengan grafik tren tersendiri — murni informasi, sengaja tanpa ambang/alert
+- Tegangan panel surya (voltage divider) — murni informasi, sengaja tanpa ambang, alert, maupun grafik
 - Kekuatan sinyal WiFi (RSSI) masing-masing board
-- Status online/offline tiap perangkat, waktu data terakhir masuk
+- Status online/offline tiap perangkat, waktu data terakhir masuk — perangkat dianggap **offline setelah 2 menit** tanpa data masuk
 
 **Kendali**
 - Kipas: mode otomatis (histeresis berbasis threshold) atau manual
 - Threshold suhu/kelembapan/VOC yang bisa diatur sendiri lewat dual-range slider
 - **Deteksi kebusukan buah**: status Segar / Mulai Busuk / Busuk dari kombinasi VOC, suhu, dan kelembapan, dengan ambang yang juga bisa diatur sendiri
+- **Simpan rentang**: rentang ideal dan rentang kebusukan disimpan lewat tombol *Simpan*, jadi perangkat mana pun yang membuka dashboard melihat nilai yang sama (bukan kembali ke default). 5 penyimpanan terakhir tersimpan sebagai riwayat yang bisa dipakai lagi; yang lebih lama terhapus otomatis
 
 **Kamera (ESP32-CAM)**
 - Snapshot otomatis tiap 30 menit + tombol "Ambil sekarang" untuk capture on-demand
@@ -190,7 +199,7 @@ Dashboard web untuk memantau dan mengendalikan kondisi lingkungan dalam sebuah b
 
 **Lainnya**
 - Rekomendasi berbasis aturan yang membandingkan kondisi terkini vs threshold
-- Banner peringatan untuk status "Busuk" dan perangkat offline, opsional notifikasi push browser
+- Banner peringatan untuk status "Busuk" dan perangkat offline, plus **notifikasi push yang jalan di iOS, Android, dan desktop** (bahkan saat halaman web ditutup). Di iPhone/iPad, pasang dulu ke Layar Utama (iOS 16.4+)
 - Unduh data: CSV data sensor dan ZIP foto kamera, rentang tanggal bebas pilih, nama file & manifest yang manusiawi (bukan epoch mentah)
 - Desain glassmorphism, responsif dari mobile sampai desktop
 
@@ -212,14 +221,16 @@ Dashboard web untuk memantau dan mengendalikan kondisi lingkungan dalam sebuah b
 │  Postgres                              Storage (bucket public-read) │
 │  ├─ sensor_readings (+rssi,            ├─ firmware/   (.bin OTA)    │
 │  │  tegangan_panel)                    └─ snapshots/  (foto kamera) │
-│  ├─ box_settings (threshold, fan)                                   │
+│  ├─ box_settings (mode kipas + threshold dibaca ESP32)              │
+│  ├─ range_settings / range_history (rentang tersimpan, 5 terakhir)  │
+│  ├─ push_subscriptions / alert_state (notifikasi push)              │
 │  ├─ ota_firmware (versi per device)     Edge Functions               │
 │  ├─ wifi_config (SSID/pass baru)        ├─ check-ota-pin             │
 │  ├─ wifi_history (log, cap 3/device)    │    validasi PIN di server  │
-│  ├─ device_logs (cap 50/device)         └─ cleanup-old-snapshots     │
-│  ├─ camera_snapshots                         hapus foto >7 hari      │
+│  ├─ device_logs (cap 50/device)         ├─ cleanup-old-snapshots     │
+│  ├─ camera_snapshots                    │    hapus foto >7 hari      │
 │  ├─ camera_command (trigger manual)          (dijadwalkan pg_cron)   │
-│  └─ camera_status (heartbeat+rssi)                                   │
+│  └─ camera_status (heartbeat+rssi)      └─ send-alerts (web push/menit)│
 │                                                                       │
 │  Realtime (postgres_changes, per tabel lewat publication)            │
 └────────────────────────────┬──────────────────────────────────────────┘
@@ -240,6 +251,10 @@ Dashboard web untuk memantau dan mengendalikan kondisi lingkungan dalam sebuah b
 **Alur OTA**: Dashboard upload file `.bin` ke bucket `firmware`, menyimpan versi target di `ota_firmware` — tapi baru tersimpan kalau PIN yang dimasukkan lolos validasi `check-ota-pin` (Edge Function; PIN asli tidak pernah ikut ter-bundle ke JavaScript). Tiap board polling tabel ini, bandingkan versi, dan jalankan `HTTPUpdate` kalau ada versi baru.
 
 **Alur WiFi**: Dashboard menulis SSID/password baru ke `wifi_config`. Board polling, coba konek ke WiFi baru; kalau gagal tersambung dalam 15 detik, otomatis kembali ke WiFi sebelumnya (kredensial lama tetap tersimpan lewat `Preferences`/NVS). Hasil percobaan dicatat ke `wifi_history`, dibatasi otomatis ke 3 entri terakhir per device lewat trigger Postgres.
+
+**Alur simpan rentang**: tombol *Simpan* menulis rentang ideal + rentang kebusukan ke `range_settings` (yang dimuat tiap perangkat saat dibuka), menambah baris ke `range_history` (trigger Postgres menyisakan 5 terbaru), dan memperbarui `box_settings` supaya logika kipas ESP32 memakai ambang baru. Tidak ada yang dikirim ke database selama slider hanya digeser, jadi perangkat kedua yang membuka dashboard tidak bisa menimpa nilai tersimpan dengan default.
+
+**Alur notifikasi**: menekan lonceng mendaftarkan service worker (`public/sw.js`), meminta izin, dan menyimpan langganan Web Push perangkat itu di `push_subscriptions`. Tiap menit `pg_cron` memanggil Edge Function `send-alerts`, yang mengecek pembacaan baru yang busuk atau perangkat tanpa data selama 2 menit, lalu mengirim push **sekali per kejadian** (dicatat di `alert_state`) ke semua perangkat yang berlangganan — jadi peringatan tetap masuk walau tidak ada tab browser yang terbuka.
 
 **Alur log**: Firmware punya helper `logRemote()` yang sekaligus `Serial.println` lokal dan POST fire-and-forget ke `device_logs`. Dashboard **tidak** subscribe realtime ke tabel ini — baru fetch saat tombol "Lihat Log" ditekan, supaya terasa seperti buka Serial Monitor manual. Baris lama dibatasi otomatis ke 50 per device lewat trigger.
 
@@ -273,6 +288,7 @@ Gerbang OTA (PIN) divalidasi di Edge Function `check-ota-pin`, bukan di kode Rea
 4. Tambahkan Environment Variables di Project Settings → Environment Variables:
    - `VITE_SUPABASE_URL`
    - `VITE_SUPABASE_ANON_KEY`
+   - `VITE_VAPID_PUBLIC_KEY` (kunci publik untuk notifikasi push)
 5. Deploy
 
 ### Firmware
