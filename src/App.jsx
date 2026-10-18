@@ -1107,22 +1107,6 @@ export default function App() {
     };
   }, [supabase, fanMode, fanManualOn]);
 
-  // kirim mode kipas ke tabel box_settings supaya ESP32 bisa membacanya.
-  // Ambang (threshold) TIDAK ikut dikirim otomatis lagi — baru dikirim saat tombol Simpan ditekan,
-  // supaya perangkat lain yang baru membuka web tidak menimpa pengaturan dengan nilai default.
-  useEffect(() => {
-    if (!supabase || !rangesLoaded) return;
-    const id = setTimeout(() => {
-      supabase
-        .from("box_settings")
-        .upsert({ id: 1, fan_mode: fanMode, fan_manual_on: fanManualOn })
-        .then(({ error }) => {
-          if (error) setSupaStatus("error");
-        });
-    }, 500);
-    return () => clearTimeout(id);
-  }, [supabase, rangesLoaded, fanMode, fanManualOn]);
-
   // rekomendasi AI mengikuti data & threshold
   useEffect(() => {
     setInsights(buildInsights(current, thresholds, fanOn, fanMode, tick));
@@ -1256,6 +1240,22 @@ export default function App() {
     setBusukThresholds(r.busuk);
     setRangeMsg({ ok: true, text: "Rentang dari riwayat dimuat — klik Simpan untuk menerapkannya." });
   };
+
+  // kirim mode kipas ke tabel box_settings supaya ESP32 bisa membacanya.
+  // Ambang (threshold) TIDAK ikut dikirim otomatis lagi — baru dikirim saat tombol Simpan ditekan,
+  // supaya perangkat lain yang baru membuka web tidak menimpa pengaturan dengan nilai default.
+  useEffect(() => {
+    if (!supabase || !rangesLoaded) return;
+    const id = setTimeout(() => {
+      supabase
+        .from("box_settings")
+        .upsert({ id: 1, fan_mode: fanMode, fan_manual_on: fanManualOn })
+        .then(({ error }) => {
+          if (error) setSupaStatus("error");
+        });
+    }, 500);
+    return () => clearTimeout(id);
+  }, [supabase, rangesLoaded, fanMode, fanManualOn]);
 
   const BUSUK_COLOR = { ideal: "#6ee7b7", waspada: "#facc15", tinggi: "#fb7185" };
 
